@@ -592,6 +592,7 @@ pub fn submit_daemon_internal_daemon_logs(events: Vec<DaemonLogEvent>) -> bool {
 /// dedicated telemetry runtime, so slow uploads or a contended metrics DB can
 /// never occupy the daemon runtime that command/checkpoint processing uses.
 pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
+    crate::otel::spawn_worker();
     let buffer = Arc::new(Mutex::new(TelemetryBuffer::new()));
     let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel();
     let (metrics_reingest_tx, metrics_reingest_rx) = tokio::sync::mpsc::unbounded_channel();

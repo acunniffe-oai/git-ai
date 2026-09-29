@@ -16,6 +16,7 @@ pub mod mdm;
 pub mod metrics;
 pub mod notes;
 pub mod observability;
+pub(crate) mod otel;
 pub mod process_timeout;
 pub mod repo_url;
 pub(crate) mod sandbox;

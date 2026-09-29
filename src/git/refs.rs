@@ -519,6 +519,12 @@ pub(in crate::git) fn notes_add_batch(
         }
         writer.write_all(b"\n")
     })?;
+    crate::otel::notes_updated(
+        repo,
+        deduped_entries
+            .iter()
+            .map(|entry| (entry.0.as_str(), entry.1.as_str())),
+    );
     crate::authorship::git_ai_hooks::post_notes_updated_refs(
         repo,
         deduped_entries
@@ -585,7 +591,7 @@ pub(in crate::git) fn notes_add_blob_batch(
     let has_post_notes_updated_hooks = crate::config::Config::get()
         .git_ai_hook_commands("post_notes_updated")
         .is_some_and(|commands| !commands.is_empty());
-    if has_post_notes_updated_hooks {
+    if has_post_notes_updated_hooks || crate::otel::enabled() {
         let hook_entries = (|| -> Result<Vec<(String, String)>, GitAiError> {
             let mut unique_blob_oids: Vec<String> = deduped_entries
                 .iter()
@@ -607,6 +613,12 @@ pub(in crate::git) fn notes_add_blob_batch(
         })();
         match hook_entries {
             Ok(entries) if !entries.is_empty() => {
+                crate::otel::notes_updated(
+                    repo,
+                    entries
+                        .iter()
+                        .map(|(sha, content)| (sha.as_str(), content.as_str())),
+                );
                 crate::authorship::git_ai_hooks::post_notes_updated(repo, &entries)
             }
             Ok(_) => {}

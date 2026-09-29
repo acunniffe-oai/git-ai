@@ -325,6 +325,10 @@ struct AwaitResult {
     timed_out: bool,
     metrics_remaining: usize,
     notes_remaining: usize,
+    #[serde(default)]
+    otel_remaining: usize,
+    #[serde(default)]
+    otel_failed: usize,
 }
 
 struct DaemonProcessActiveGuard;
@@ -7255,6 +7259,23 @@ impl ActorDaemonCoordinator {
         applied: &crate::daemon::domain::AppliedCommand,
         commit_file_timestamp_snapshots: &mut CommitFileTimestampSnapshotHandles,
     ) -> Result<(), GitAiError> {
+        crate::otel::capture_operation(
+            applied.command.finished_at_ns,
+            self.apply_side_effects_for_applied_command(
+                family,
+                applied,
+                commit_file_timestamp_snapshots,
+            ),
+        )
+        .await
+    }
+
+    async fn apply_side_effects_for_applied_command(
+        &self,
+        family: Option<&str>,
+        applied: &crate::daemon::domain::AppliedCommand,
+        commit_file_timestamp_snapshots: &mut CommitFileTimestampSnapshotHandles,
+    ) -> Result<(), GitAiError> {
         // Test-only: allow inducing a panic in the side-effect pipeline to verify
         // that the daemon's catch_unwind recovery keeps the process alive.
         // Uses a file-based flag so the test can remove the file between commands.
@@ -8382,6 +8403,8 @@ impl ActorDaemonCoordinator {
             timed_out: false,
             metrics_remaining: 0,
             notes_remaining: 0,
+            otel_remaining: 0,
+            otel_failed: 0,
         };
 
         let mut maybe_log = |phase: &str| {
@@ -8486,7 +8509,8 @@ impl ActorDaemonCoordinator {
             }
         }
 
-        // Phase 3: flush telemetry and wait for the worker to finish.
+        // Phase 3: flush both independent telemetry workers.
+        let mut telemetry_flush_failed = false;
         if !result.timed_out
             && let Some(worker) = &self.telemetry_worker
         {
@@ -8494,13 +8518,30 @@ impl ActorDaemonCoordinator {
             if now < deadline {
                 let remaining = deadline - now;
                 maybe_log("telemetry flush");
-                match timeout(remaining, worker.flush_and_wait()).await {
-                    Ok(Ok(status)) => {
-                        result.metrics_remaining = status.metrics_remaining;
-                        result.notes_remaining = status.notes_remaining;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "await: telemetry flush failed");
+                let flushes =
+                    async { tokio::join!(worker.flush_and_wait(), crate::otel::flush_and_wait()) };
+                match timeout(remaining, flushes).await {
+                    Ok((regular, otel)) => {
+                        match regular {
+                            Ok(status) => {
+                                result.metrics_remaining = status.metrics_remaining;
+                                result.notes_remaining = status.notes_remaining;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "await: telemetry flush failed");
+                                telemetry_flush_failed = true;
+                            }
+                        }
+                        match otel {
+                            Ok(status) => {
+                                result.otel_remaining = status.remaining;
+                                result.otel_failed = status.failed;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "await: OTLP flush failed");
+                                telemetry_flush_failed = true;
+                            }
+                        }
                     }
                     Err(_) => {
                         result.timed_out = true;
@@ -8512,8 +8553,10 @@ impl ActorDaemonCoordinator {
         }
 
         result.done = !result.timed_out
+            && !telemetry_flush_failed
             && result.metrics_remaining == 0
             && result.notes_remaining == 0
+            && result.otel_remaining == 0
             && !self.has_pending_daemon_work();
         result
     }

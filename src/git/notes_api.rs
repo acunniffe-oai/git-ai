@@ -20,7 +20,11 @@ pub use crate::git::refs::CommitAuthorship;
 
 pub fn write_note(repo: &Repository, commit_sha: &str, content: &str) -> Result<(), GitAiError> {
     match Config::get().notes_backend_kind() {
-        NotesBackendKind::Http => http_write_note(commit_sha, content),
+        NotesBackendKind::Http => {
+            http_write_note(commit_sha, content)?;
+            crate::otel::notes_updated(repo, [(commit_sha, content)]);
+            Ok(())
+        }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add(repo, commit_sha, content),
     }
 }
@@ -33,7 +37,16 @@ pub fn write_notes_batch(
         return Ok(());
     }
     match Config::get().notes_backend_kind() {
-        NotesBackendKind::Http => http_write_batch(entries),
+        NotesBackendKind::Http => {
+            http_write_batch(entries)?;
+            crate::otel::notes_updated(
+                repo,
+                entries
+                    .iter()
+                    .map(|(sha, content)| (sha.as_str(), content.as_str())),
+            );
+            Ok(())
+        }
         NotesBackendKind::GitNotes => crate::git::refs::notes_add_batch(repo, entries),
     }
 }

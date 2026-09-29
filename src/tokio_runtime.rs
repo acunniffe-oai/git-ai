@@ -115,6 +115,19 @@ pub(crate) fn telemetry_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// OTLP delivery can stall independently of regular telemetry. Keep one
+/// blocking slot available for durable source writes while its uploader waits.
+pub(crate) fn otel_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        build_bounded_runtime(
+            TELEMETRY_RUNTIME_WORKER_THREADS,
+            TELEMETRY_RUNTIME_MAX_BLOCKING_THREADS,
+        )
+        .expect("failed to create OTLP runtime")
+    })
+}
+
 pub fn initialize() {
     let _ = runtime();
 }
