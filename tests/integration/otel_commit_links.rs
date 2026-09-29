@@ -172,6 +172,61 @@ fn check_commit_link(kind: NotesBackendKind) {
 }
 
 #[test]
+fn otel_links_use_logs_while_legacy_metrics_keep_their_upload_route() {
+    let metrics_dir = tempfile::tempdir().unwrap();
+    let metrics_path = metrics_dir.path().join("metrics.db");
+    let mut fixture = Fixture::with_options(
+        NotesBackendKind::GitNotes,
+        200,
+        &[(
+            "GIT_AI_TEST_METRICS_DB_PATH",
+            metrics_path.to_str().unwrap(),
+        )],
+    );
+    fixture._backend_mock.remove();
+    let batches = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = batches.clone();
+    let legacy = fixture
+        ._server
+        .mock("POST", "/api/gitai/worker/metrics/upload")
+        .match_header("x-api-key", "test-otel-key")
+        .expect_at_least(1)
+        .with_status(404)
+        .with_body_from_request(move |request| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(request.body().unwrap()).unwrap());
+            br#"{"error":"not found"}"#.to_vec()
+        })
+        .create();
+
+    let sha = fixture.commit();
+    let response = git_ai::daemon::send_control_request(
+        &fixture.repo.daemon_control_socket_path(),
+        &git_ai::daemon::ControlRequest::Await { timeout_secs: 15 },
+    )
+    .unwrap();
+    assert_eq!(response.data.unwrap()["otel_remaining"], 0);
+    let records = fixture.wait_for(&sha, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(attribute(&records[0], "event.name"), EVENT);
+
+    assert!(legacy.matched(), "legacy metrics must still be uploaded");
+    for batch in batches.lock().unwrap().iter() {
+        assert_eq!(batch["v"], 1);
+        assert!(batch.get("resourceLogs").is_none());
+        let events = batch["events"].as_array().unwrap();
+        assert!(!events.is_empty());
+        for event in events {
+            assert!(event["e"].is_u64());
+            assert!(event["v"].is_object());
+            assert!(event["a"].is_object());
+        }
+    }
+}
+
+#[test]
 fn otel_await_reports_permanent_failure_without_retrying_it() {
     let fixture = Fixture::with_options(NotesBackendKind::GitNotes, 403, &[]);
     let sha = fixture.commit();
