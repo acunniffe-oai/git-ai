@@ -1,8 +1,10 @@
 use crate::config::{CodexHooksFormat, Config};
 use crate::error::GitAiError;
+use crate::mdm::agent_otel::{codex_otel, generate_config_diff as generate_diff};
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
+use crate::mdm::utils::write_private_atomic;
 use crate::mdm::utils::{
-    binary_exists, codex_home_dir, generate_diff, is_git_ai_checkpoint_command, write_atomic,
+    binary_exists, codex_home_dir, is_git_ai_checkpoint_command, write_atomic,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -35,7 +37,7 @@ impl CodexInstaller {
         }
 
         let parsed: TomlValue = toml::from_str(content)
-            .map_err(|e| GitAiError::Generic(format!("Failed to parse Codex config.toml: {e}")))?;
+            .map_err(|_| GitAiError::Generic("Failed to parse Codex config.toml".into()))?;
 
         if !parsed.is_table() {
             return Err(GitAiError::Generic(
@@ -866,6 +868,42 @@ impl HookInstaller for CodexInstaller {
         }
 
         Ok(Some(diff_output.join("\n")))
+    }
+
+    fn configure_otel(
+        &self,
+        settings: &JsonValue,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        let desired = codex_otel(settings)?;
+        let path = Self::config_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut config = Self::parse_config_toml(&content)?;
+        let before = config.clone();
+        let root = config.as_table_mut().expect("validated TOML table");
+        let otel = root
+            .entry("otel")
+            .or_insert_with(|| TomlValue::Table(Map::new()));
+        let otel = otel
+            .as_table_mut()
+            .ok_or_else(|| GitAiError::Generic("Codex otel must be a table".into()))?;
+        // Replace each returned field, including whole exporter variants;
+        // preserve unrelated native settings rather than replacing the file.
+        otel.extend(desired.as_table().expect("serialized OTEL table").clone());
+        if config == before {
+            return Ok(None);
+        }
+        let new_content = toml::to_string_pretty(&config)
+            .map_err(|_| GitAiError::Generic("Could not encode Codex config.toml".into()))?;
+        let diff = generate_diff(&path, &content, &new_content);
+        if !dry_run {
+            write_private_atomic(&path, new_content.as_bytes())?;
+        }
+        Ok(Some(diff))
     }
 
     fn uninstall_hooks(

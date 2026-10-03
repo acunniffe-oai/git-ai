@@ -1,7 +1,9 @@
 use crate::error::GitAiError;
+use crate::mdm::agent_otel::{claude_env, generate_config_diff as generate_diff};
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
+use crate::mdm::utils::write_private_atomic;
 use crate::mdm::utils::{
-    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, generate_diff, get_binary_version,
+    MIN_CLAUDE_VERSION, binary_exists, claude_config_dir, get_binary_version,
     is_git_ai_checkpoint_command, normalize_windows_path_for_shell, parse_version,
     version_meets_requirement, write_atomic,
 };
@@ -362,6 +364,48 @@ impl HookInstaller for ClaudeCodeInstaller {
         dry_run: bool,
     ) -> Result<Option<String>, GitAiError> {
         Self::install_hooks_at(&Self::settings_path(), params, dry_run)
+    }
+
+    fn configure_otel(
+        &self,
+        settings: &Value,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        let desired_env = claude_env(settings)?;
+        let path = Self::settings_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".into(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut config: Value = serde_json::from_str(&content)?;
+        let before = config.clone();
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| GitAiError::Generic("Claude settings must be an object".into()))?;
+        let env = root
+            .entry("env")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| GitAiError::Generic("Claude env must be an object".into()))?;
+        // Per-signal overrides take precedence over the server's common OTLP
+        // destination/protocol/headers, so remove them when taking ownership.
+        for signal in ["LOGS", "TRACES", "METRICS"] {
+            for setting in ["ENDPOINT", "PROTOCOL", "HEADERS"] {
+                env.remove(&format!("OTEL_EXPORTER_OTLP_{signal}_{setting}"));
+            }
+        }
+        env.extend(desired_env);
+        root.remove("otelHeadersHelper");
+        if config == before {
+            return Ok(None);
+        }
+        let new_content = serde_json::to_string_pretty(&config)?;
+        let diff = generate_diff(&path, &content, &new_content);
+        if !dry_run {
+            write_private_atomic(&path, new_content.as_bytes())?;
+        }
+        Ok(Some(diff))
     }
 
     fn uninstall_hooks(

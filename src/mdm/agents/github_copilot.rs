@@ -17,8 +17,7 @@ pub struct GitHubCopilotInstaller;
 
 impl GitHubCopilotInstaller {
     fn hooks_path() -> PathBuf {
-        home_dir()
-            .join(".copilot")
+        crate::mdm::copilot_otel::copilot_home()
             .join("hooks")
             .join("git-ai.json")
     }
@@ -100,14 +99,19 @@ impl HookInstaller for GitHubCopilotInstaller {
     }
 
     fn process_names(&self) -> Vec<&str> {
-        vec!["Code", "code"]
+        vec!["Code", "code", "copilot"]
+    }
+
+    fn configure_otel(&self, agent: &Value, dry_run: bool) -> Result<Option<String>, GitAiError> {
+        crate::mdm::copilot_otel::configure(agent, dry_run)
     }
 
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
         let resolved_cli = resolve_editor_cli("code");
         let has_cli = resolved_cli.is_some();
         let has_vscode_dotfiles = home_dir().join(".vscode").exists();
-        let has_copilot_dotfiles = home_dir().join(".copilot").exists();
+        let has_copilot_dotfiles =
+            crate::mdm::copilot_otel::cli_present() || Self::hooks_path().exists();
         let has_github_dotfiles = home_dir().join(".github").exists();
         let has_settings_targets = Self::settings_targets()
             .iter()

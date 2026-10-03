@@ -223,6 +223,12 @@ fn test_to_hashmap_all_statuses() {
 
 #[test]
 fn plain_install_hooks_preserves_the_invoking_user_home() {
+    let mut server = mockito::Server::new();
+    let _discovery = server
+        .mock("GET", "/api/client-config")
+        .with_status(200)
+        .with_body(r#"{"version":1,"logLevel":"off","agents":{}}"#)
+        .create();
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
     let invoking_home = repo.test_home_path();
     let installed_home = repo.path().join("installed-user");
@@ -242,6 +248,8 @@ fn plain_install_hooks_preserves_the_invoking_user_home() {
         .current_dir(repo.path())
         .env("HOME", invoking_home)
         .env("API_KEY", "package-test-key")
+        .env("API_BASE", server.url())
+        .env_remove("GIT_AI_API_KEY")
         .env("GIT_AI_TEST_DB_PATH", &test_db)
         .env("GITAI_TEST_DB_PATH", &test_db)
         .env("GIT_CONFIG_GLOBAL", invoking_home.join(".gitconfig"))

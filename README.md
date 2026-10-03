@@ -200,7 +200,7 @@ Yes. Git AI is free and open source, works locally, and requires no login or tea
 No. Git AI does not use Git hooks and it does not wrap Git, so you won't see any overhead on your Git commands.
 
 #### Do I have to set up agent hooks?
-Nope — Git AI manages the agent hooks and checks/updates them daily. If you want to trigger this yourself (ie just installed a new agent) run `git ai install-hooks`.
+Nope — Git AI manages the agent hooks and checks/updates them daily. If you want to trigger this yourself (ie just installed a new agent) run `git ai install-hooks`. With an API token configured, this also applies your server’s [agent OTEL settings](docs/agent-otel-setup.md).
 
 #### Who uses this?
 Hundreds of engineering teams (including many in the Fortune 100) use Git AI to understand their AI usage and make agents more effective on their codebase.

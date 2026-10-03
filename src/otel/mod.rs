@@ -73,6 +73,8 @@ fn session(agent: &AgentId) -> Option<Session> {
         "claude" | "claude-code" => "claude-code",
         "codex" => "codex",
         "devin" => "devin",
+        "github-copilot" => "github-copilot",
+        "github-copilot-cli" => "github-copilot-cli",
         _ => return None,
     };
     if agent.id.is_empty() || agent.id == "unknown" || agent.id.starts_with("DEVIN_SESSION") {
@@ -308,6 +310,8 @@ mod tests {
         for (tool, expected) in [
             ("claude", Some("claude-code")),
             ("claude-code", Some("claude-code")),
+            ("github-copilot", Some("github-copilot")),
+            ("github-copilot-cli", Some("github-copilot-cli")),
             ("codex", Some("codex")),
             ("devin", Some("devin")),
             ("mock_ai", None),

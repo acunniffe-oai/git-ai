@@ -1,6 +1,7 @@
 use crate::config;
 use crate::daemon::DaemonConfig;
 use crate::error::GitAiError;
+use crate::mdm::agent_otel::ClientConfiguration;
 use crate::mdm::agents::get_all_installers;
 use crate::mdm::hook_installer::HookInstallerParams;
 use crate::mdm::skills_installer;
@@ -381,8 +382,31 @@ fn run_hooks_install(options: &InstallOptions) -> Result<HashMap<String, String>
     persist_install_config_with_values(&binary_path, options.dry_run, &install_config)?;
     let params = HookInstallerParams { binary_path };
 
-    // Run async operations and convert result.
-    let statuses = crate::tokio_runtime::block_on(async_run_install(&params, options))?;
+    // Fresh config sees same-run persistence. Overlay installer values for dry
+    // runs too, retaining the normal GIT_AI_API_KEY > file key precedence.
+    let current = config::Config::fresh();
+    let key = std::env::var("GIT_AI_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .or_else(|| install_config.api_key.clone())
+        .or_else(|| current.api_key().map(str::to_owned));
+    let base = install_config
+        .api_base
+        .as_deref()
+        .unwrap_or(current.api_base_url());
+    let client_config = match ClientConfiguration::fetch(base, key.as_deref()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Warning: could not discover agent OTEL settings: {error}");
+            None
+        }
+    };
+
+    let statuses = crate::tokio_runtime::block_on(async_run_install(
+        &params,
+        options,
+        client_config.as_ref(),
+    ))?;
 
     // Clean up legacy envelope logs directory and related artifacts.
     // These are no longer used — all telemetry now routes through the daemon.
@@ -567,6 +591,7 @@ pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, GitAiEr
 async fn async_run_install(
     params: &HookInstallerParams,
     options: &InstallOptions,
+    client_config: Option<&ClientConfiguration>,
 ) -> Result<HashMap<String, InstallStatus>, GitAiError> {
     let mut any_checked = false;
     let mut has_changes = false;
@@ -649,6 +674,64 @@ async fn async_run_install(
                             statuses.insert(id.to_string(), InstallStatus::Failed);
                             detailed_results
                                 .push((id.to_string(), InstallResult::failed(error_msg)));
+                        }
+                    }
+                }
+
+                // Discovery is optional and independent of hook freshness.
+                if let Some(config) = client_config {
+                    let result = config.for_installer(id).and_then(|settings| {
+                        settings
+                            .map(|settings| installer.configure_otel(settings, options.dry_run))
+                            .transpose()
+                    });
+                    match result {
+                        Ok(Some(Some(diff))) => {
+                            let action = if options.dry_run {
+                                "Pending OTEL updates"
+                            } else {
+                                "OTEL configured"
+                            };
+                            println!("  {name}: {action}");
+                            if options.verbose {
+                                print_diff(&diff);
+                            }
+                            has_changes = true;
+                            if statuses.get(id) != Some(&InstallStatus::Failed) {
+                                statuses.insert(id.to_string(), InstallStatus::Installed);
+                                if let Some((_, detail)) =
+                                    detailed_results.iter_mut().find(|(tool, _)| tool == id)
+                                {
+                                    detail.status = InstallStatus::Installed;
+                                }
+                            }
+                            if !options.dry_run
+                                && !updated_agents.iter().any(|(agent, _)| agent == name)
+                            {
+                                let names = installer
+                                    .process_names()
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>();
+                                if !names.is_empty() {
+                                    updated_agents.push((name.to_owned(), names));
+                                }
+                            }
+                        }
+                        Ok(Some(None)) => println!("  {name}: OTEL already up to date"),
+                        Ok(None) => {}
+                        Err(_) => {
+                            // Do not include parser source excerpts or remote values in
+                            // warnings/metrics: either may contain authentication headers.
+                            let warning = format!(
+                                "{name}: could not configure OTEL; existing OTEL settings left unchanged"
+                            );
+                            eprintln!("  Warning: {warning}");
+                            if let Some((_, detail)) =
+                                detailed_results.iter_mut().find(|(tool, _)| tool == id)
+                            {
+                                detail.warnings.push(warning);
+                            }
                         }
                     }
                 }

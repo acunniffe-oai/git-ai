@@ -64,6 +64,15 @@ pub trait HookInstaller: Send + Sync {
         dry_run: bool,
     ) -> Result<Option<String>, GitAiError>;
 
+    /// Apply discovered native OTEL settings for an enabled, detected agent.
+    fn configure_otel(
+        &self,
+        _settings: &serde_json::Value,
+        _dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        Ok(None)
+    }
+
     /// Uninstall hooks
     /// Returns Ok(Some(diff)) if changes were made, Ok(None) if nothing to uninstall
     fn uninstall_hooks(

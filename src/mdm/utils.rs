@@ -461,6 +461,14 @@ pub fn gemini_config_dir() -> PathBuf {
 /// Write data to a file atomically (write to temp, then rename)
 /// If the path is a symlink, writes to the target file (preserving the symlink)
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
+    write_atomic_with_privacy(path, data, false)
+}
+
+pub(crate) fn write_private_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
+    write_atomic_with_privacy(path, data, true)
+}
+
+fn write_atomic_with_privacy(path: &Path, data: &[u8], private: bool) -> Result<(), GitAiError> {
     let target_path = if path.is_symlink() {
         fs::canonicalize(path).map_err(|e| {
             GitAiError::Generic(format!(
@@ -480,17 +488,37 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
 
     let tmp_path = target_path.with_extension("tmp");
     {
-        let mut file = fs::File::create(&tmp_path).map_err(|e| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = if private {
+                0o600
+            } else {
+                fs::metadata(&target_path)
+                    .map(|m| m.permissions().mode() & 0o777)
+                    .unwrap_or(0o666)
+            };
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&tmp_path).map_err(|e| {
             GitAiError::Generic(format!(
                 "Failed to create temp file {}: {}",
                 tmp_path.display(),
                 e
             ))
         })?;
-        file.write_all(data)?;
-        file.sync_all()?;
+        if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error.into());
+        }
     }
     fs::rename(&tmp_path, &target_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
         GitAiError::Generic(format!(
             "Failed to rename {} to {}: {}",
             tmp_path.display(),
@@ -783,7 +811,8 @@ pub fn update_vscode_chat_hook_settings(
     }
 
     let new_content = root.to_string();
-    let diff_output = generate_diff(settings_path, &original, &new_content);
+    let diff_output =
+        crate::mdm::agent_otel::generate_config_diff(settings_path, &original, &new_content);
 
     if !dry_run {
         if let Some(parent) = settings_path.parent()
@@ -791,7 +820,7 @@ pub fn update_vscode_chat_hook_settings(
         {
             fs::create_dir_all(parent)?;
         }
-        write_atomic(settings_path, new_content.as_bytes())?;
+        write_private_atomic(settings_path, new_content.as_bytes())?;
     }
 
     Ok(Some(diff_output))

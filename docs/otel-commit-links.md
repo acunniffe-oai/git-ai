@@ -12,7 +12,7 @@ OTLP/JSON and `Authorization: Bearer <api_key>`; OAuth login alone does not enab
 this outbox. The notes backend URL does not select the OTLP destination.
 
 Both HTTP and Git notes trigger links. Claude (`claude` internally) is sent as
-`claude-code`; Codex and Devin retain their tool names. Session IDs are the
+`claude-code`; Codex, Devin, `github-copilot` (VS Code), and `github-copilot-cli` retain their tool names. Session IDs are the
 agents' original IDs. Unsupported agents, known placeholder IDs, empty patches,
 and records missing required commit metadata are skipped. Optional branch and
 user-email attributes are omitted. Prompts, diffs, usage data, and custom

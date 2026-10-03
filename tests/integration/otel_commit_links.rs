@@ -818,3 +818,57 @@ fn otel_squash_links_both_raw_sessions() {
     sessions.sort();
     assert_eq!(sessions, ["raw-session-id", "second-session"]);
 }
+
+#[test]
+fn otel_copilot_surfaces_keep_exact_hook_ids_and_distinct_agent_names() {
+    let fixture = Fixture::new(NotesBackendKind::GitNotes);
+    let transcript = fixture
+        ._dir
+        .path()
+        .join("GitHub.copilot-chat/transcripts/session.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, "{}\n").unwrap();
+    for (filename, ide) in [("cli.txt", false), ("ide.txt", true)] {
+        let path = fixture.repo.path().join(filename);
+        for event in ["PreToolUse", "PostToolUse"] {
+            if event == "PostToolUse" {
+                fs::write(&path, "Copilot line\n").unwrap();
+            }
+            let mut hook = serde_json::json!({"hook_event_name":event,"cwd":fixture.repo.path(),"session_id":"same-raw-id","tool_name":if ide {"create_file"} else {"create"},"tool_input":{"file_path":path},"tool_use_id":filename});
+            if ide {
+                hook["transcript_path"] = serde_json::json!(transcript);
+            }
+            fixture
+                .repo
+                .git_ai(&[
+                    "checkpoint",
+                    "github-copilot",
+                    "--hook-input",
+                    &hook.to_string(),
+                ])
+                .unwrap();
+        }
+    }
+    let commit = fixture
+        .repo
+        .stage_all_and_commit("Both Copilot surfaces")
+        .unwrap();
+    let mut pairs: Vec<_> = fixture
+        .wait_for(&commit.commit_sha, 2)
+        .iter()
+        .map(|r| {
+            (
+                attribute(r, "git_ai.agent").to_owned(),
+                attribute(r, "session.id").to_owned(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        [
+            ("github-copilot".to_owned(), "same-raw-id".to_owned()),
+            ("github-copilot-cli".to_owned(), "same-raw-id".to_owned())
+        ]
+    );
+}
