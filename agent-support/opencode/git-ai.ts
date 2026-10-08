@@ -3,7 +3,7 @@
  *
  * This plugin integrates git-ai with OpenCode to track AI-generated code.
  * It uses the tool.execute.before and tool.execute.after events to create
- * checkpoints that mark code changes as human or AI-authored.
+ * lightweight checkpoints that link native sessions to commits.
  *
  * Installation:
  *   - Automatically installed by `git-ai install-hooks`
@@ -19,8 +19,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { spawn } from "child_process"
-import { readFile, stat } from "fs/promises"
-import { dirname, isAbsolute, join, resolve } from "path"
+import { isAbsolute, join } from "path"
 
 // Absolute path to git-ai binary, replaced at install time by `git-ai install-hooks`
 const GIT_AI_BIN = "__GIT_AI_BINARY_PATH__"
@@ -272,85 +271,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
   const defaultCwd = worktree || directory || process.cwd()
 
   // Track pending calls by callID so we can reference them in the after hook
-  const pendingCalls = new Map<string, { repoDir: string; sessionID: string; toolInput: unknown }>()
-
-  const nearestExistingDirectory = async (pathHint: string): Promise<string | null> => {
-    let candidate = pathHint
-    while (candidate) {
-      try {
-        const fileStat = await stat(candidate)
-        return fileStat.isDirectory() ? candidate : dirname(candidate)
-      } catch (error) {
-        debugLog(`failed to stat path while resolving git repo from ${candidate}`, error)
-      }
-
-      const parent = dirname(candidate)
-      if (parent === candidate) {
-        break
-      }
-      candidate = parent
-    }
-
-    return null
-  }
-
-  const isGitDirPointer = async (gitFilePath: string, worktreeDir: string): Promise<boolean> => {
-    try {
-      const firstLine = (await readFile(gitFilePath, "utf8")).split(/\r?\n/, 1)[0]?.trim() ?? ""
-      if (!firstLine.toLowerCase().startsWith("gitdir:")) {
-        return false
-      }
-
-      const gitDir = firstLine.slice("gitdir:".length).trim()
-      if (!gitDir) {
-        return false
-      }
-
-      const gitDirPath = isAbsolute(gitDir) || /^[a-zA-Z]:[\\/]/.test(gitDir)
-        ? gitDir
-        : resolve(worktreeDir, gitDir)
-      return (await stat(gitDirPath)).isDirectory()
-    } catch (error) {
-      debugLog(`failed to read gitdir pointer from ${gitFilePath}`, error)
-      return false
-    }
-  }
-
-  const hasGitMetadata = async (dir: string): Promise<boolean> => {
-    const marker = join(dir, ".git")
-    try {
-      const fileStat = await stat(marker)
-      if (fileStat.isDirectory()) {
-        return true
-      }
-
-      if (fileStat.isFile()) {
-        return await isGitDirPointer(marker, dir)
-      }
-    } catch (error) {
-      debugLog(`failed to inspect git metadata at ${marker}`, error)
-    }
-
-    return false
-  }
-
-  // Helper to find git repo root from a file path or directory
-  const findGitRepo = async (pathHint: string): Promise<string | null> => {
-    let dir = await nearestExistingDirectory(pathHint)
-    while (dir) {
-      if (await hasGitMetadata(dir)) {
-        return dir
-      }
-
-      const parent = dirname(dir)
-      if (parent === dir) {
-        break
-      }
-      dir = parent
-    }
-
-    return null
-  }
+  const pendingCalls = new Map<string, { repoDir: string; sessionID: string; filePaths: string[]; command?: string }>()
 
   const resolveCwd = (cwd?: string): string => {
     if (!cwd) {
@@ -358,42 +279,6 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
     }
 
     return normalizePath(cwd, defaultCwd) || defaultCwd
-  }
-
-  const resolveRepoDir = async (filePaths: string[], cwd?: string): Promise<string | null> => {
-    const seenHints = new Set<string>()
-    const findGitRepoOnce = async (pathHint: string | undefined): Promise<string | null> => {
-      if (!pathHint || seenHints.has(pathHint)) {
-        return null
-      }
-
-      seenHints.add(pathHint)
-      return await findGitRepo(pathHint)
-    }
-
-    for (const filePath of filePaths) {
-      const repo = await findGitRepoOnce(filePath)
-      if (repo) {
-        return repo
-      }
-    }
-
-    const fromCwd = await findGitRepoOnce(cwd)
-    if (fromCwd) {
-      return fromCwd
-    }
-
-    const fromDefaultCwd = await findGitRepoOnce(defaultCwd)
-    if (fromDefaultCwd) {
-      return fromDefaultCwd
-    }
-
-    const fromProcessCwd = await findGitRepoOnce(process.cwd())
-    if (fromProcessCwd) {
-      return fromProcessCwd
-    }
-
-    return null
   }
 
   const extractMetadataFilePaths = (metadata: unknown, cwd?: string): string[] => {
@@ -424,23 +309,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
     return [...paths]
   }
 
-  const withMetadataFilePaths = (toolInput: unknown, filePaths: string[]): unknown => {
-    if (filePaths.length === 0) {
-      return toolInput
-    }
 
-    if (toolInput && typeof toolInput === "object" && !Array.isArray(toolInput)) {
-      return {
-        ...toolInput,
-        file_paths: filePaths,
-      }
-    }
-
-    return {
-      input: toolInput,
-      file_paths: filePaths,
-    }
-  }
 
   return {
     "tool.execute.before": swallowHookErrors(
@@ -458,12 +327,12 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
         const toolInput = output?.args ?? input.args
         const toolCwd = resolveCwd(extractToolCwd(asRecord(toolInput)))
         const filePaths = isTrackedEdit ? extractFilePaths(toolInput, toolCwd) : []
-        const repoDir = await resolveRepoDir(filePaths, toolCwd)
-        if (!repoDir) {
-          return
-        }
+        const repoDir = toolCwd
+        if (!sessionID) return
 
-        pendingCalls.set(callID, { repoDir, sessionID, toolInput })
+        const command = typeof asRecord(toolInput)?.command === "string" ? asRecord(toolInput)?.command as string : undefined
+        pendingCalls.set(callID, { repoDir, sessionID, filePaths, command })
+        if (!isTrackedBash) return
 
         const hookInput = JSON.stringify({
           hook_event_name: "PreToolUse",
@@ -471,7 +340,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
           tool_use_id: callID,
           cwd: repoDir,
           tool_name: toolName,
-          tool_input: toolInput,
+          tool_input: { command },
         })
         await runCheckpoint(hookInput)
       },
@@ -496,7 +365,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
 
         const toolCwd = resolveCwd(extractToolCwd(asRecord(input.args)))
         const metadataFilePaths = extractMetadataFilePaths(output?.metadata, toolCwd)
-        const toolInput = withMetadataFilePaths(callInfo.toolInput, metadataFilePaths)
+        const filePaths = [...new Set([...callInfo.filePaths, ...metadataFilePaths])]
 
         const hookInput = JSON.stringify({
           hook_event_name: "PostToolUse",
@@ -504,7 +373,7 @@ const createGitAiPlugin = (ctx: Parameters<Plugin>[0]): Awaited<ReturnType<Plugi
           tool_use_id: callID,
           cwd: callInfo.repoDir,
           tool_name: toolName,
-          tool_input: toolInput,
+          tool_input: { file_paths: filePaths, command: callInfo.command },
         })
         await runCheckpoint(hookInput)
       },

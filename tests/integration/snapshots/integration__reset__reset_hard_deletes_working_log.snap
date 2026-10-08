@@ -1,5 +1,0 @@
----
-source: tests/reset.rs
-expression: snapshot_checkpoints(&checkpoints_after)
----
-[]

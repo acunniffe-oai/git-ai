@@ -1,16 +1,14 @@
 //! Global daemon telemetry handle for sending events over the control socket.
 //!
 //! When daemon mode is active, this handle is initialized once on process start
-//! and used by the observability and metrics modules to route events through the
+//! and used by the observability module to route events through the
 //! daemon instead of writing to per-PID log files.
 //!
 //! The handle maintains a persistent socket connection that is shared across all
-//! callers (telemetry, CAS, and potentially checkpoints). This avoids the
+//! callers (diagnostics and checkpoints). This avoids the
 //! overhead of opening a new connection for every fire-and-forget event.
 
-use crate::daemon::control_api::{
-    CasSyncPayload, ControlRequest, ControlResponse, TelemetryEnvelope,
-};
+use crate::daemon::control_api::{ControlRequest, ControlResponse, TelemetryEnvelope};
 use crate::daemon::{DaemonClientStream, open_local_socket_stream_with_timeout};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -119,7 +117,7 @@ pub enum DaemonTelemetryInitResult {
 /// Should be called once on process start when daemon mode is active.
 /// Ensures the daemon is running, then opens the persistent connection lazily
 /// when the first request is ready to send. The connection is reused for
-/// subsequent telemetry, CAS, and note-flush submissions.
+/// subsequent diagnostic submissions.
 ///
 /// Returns the result indicating success, failure, or skip.
 pub fn init_daemon_telemetry_handle() -> DaemonTelemetryInitResult {
@@ -186,7 +184,7 @@ pub fn daemon_telemetry_available() -> bool {
 
 /// Send a control request over the shared persistent connection.
 ///
-/// This is the unified entry point used by telemetry, CAS submissions,
+/// This is the unified entry point used by diagnostic submissions,
 /// and any other code that needs to talk to the daemon. The connection
 /// is reused across calls; if the socket is dead it will reconnect once.
 ///
@@ -213,26 +211,5 @@ pub fn submit_telemetry(envelopes: Vec<TelemetryEnvelope>) {
         return;
     }
     let request = ControlRequest::SubmitTelemetry { envelopes };
-    let _ = send_via_daemon(&request);
-}
-
-/// Submit CAS sync records to the daemon over the control socket.
-///
-/// Fire-and-forget: same as submit_telemetry.
-pub fn submit_cas(records: Vec<CasSyncPayload>) {
-    if records.is_empty() {
-        return;
-    }
-    let request = ControlRequest::SubmitCas { records };
-    let _ = send_via_daemon(&request);
-}
-
-/// Signal the daemon that new notes are pending in `notes-db` and should be
-/// flushed to the remote backend.
-///
-/// Fire-and-forget: silently drops on failure (flush will happen on the next
-/// periodic tick regardless).
-pub fn submit_notes() {
-    let request = ControlRequest::FlushNotes;
     let _ = send_via_daemon(&request);
 }

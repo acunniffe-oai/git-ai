@@ -152,10 +152,10 @@ mod tests {
         assert!(content.contains("'checkpoint', 'pi', '--hook-input', 'stdin'"));
         assert!(content.contains("--hook-input', 'stdin'"));
         assert!(content.contains("hook_event_name"));
-        assert!(content.contains("session_path"));
+        assert!(content.contains("getSessionId()"));
+        assert!(!content.contains("readSessionLines"));
         assert!(content.contains("tool_name_raw"));
         assert!(content.contains("tool_name"));
-        assert!(content.contains("will_edit_filepaths"));
         assert!(content.contains("edited_filepaths"));
         assert!(content.contains(r#"const GIT_AI_BIN = '/usr/local/bin/git-ai'"#));
     }

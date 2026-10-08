@@ -1,8 +1,8 @@
 //! Tracing layer that forwards daemon log events to the telemetry worker.
 
 use crate::api::types::{DaemonLogEvent, DaemonLogFieldValue, DaemonLogKind, DaemonLogLevel};
-use crate::authorship::secrets::redact_secrets_in_text;
 use crate::config::Config;
+use crate::secrets::redact_secrets_in_text;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};

@@ -254,8 +254,7 @@ mod tests {
     use super::*;
     use crate::daemon::analyzers::AnalyzerRegistry;
     use crate::daemon::domain::{
-        CommandScope, Confidence, FamilyKey, FamilyState, GlobalState, RefChange, WatermarkState,
-        WorktreeState,
+        CommandScope, Confidence, FamilyKey, FamilyState, GlobalState, RefChange, WorktreeState,
     };
     use std::collections::HashMap;
 
@@ -266,7 +265,6 @@ mod tests {
             worktrees: HashMap::new(),
             last_error: None,
             applied_seq: 0,
-            watermarks: WatermarkState::default(),
         }
     }
 
@@ -288,6 +286,7 @@ mod tests {
             stash_target_oid: None,
             cherry_pick_source_oids: Vec::new(),
             revert_source_oids: Vec::new(),
+            merge_commit_oid: None,
             ref_changes: vec![RefChange {
                 reference: "refs/heads/main".to_string(),
                 old: "".to_string(),

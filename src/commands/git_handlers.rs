@@ -1,7 +1,9 @@
 use crate::commands::git_hook_handlers::ENV_SKIP_MANAGED_HOOKS;
 use crate::config;
-use crate::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
-use crate::git::find_repository;
+#[cfg(feature = "test-support")]
+use crate::git::cli_parser::ParsedGitInvocation;
+use crate::git::cli_parser::parse_git_cli_args;
+#[cfg(feature = "test-support")]
 use crate::git::repository::Repository;
 #[cfg(windows)]
 use crate::utils::CREATE_NO_WINDOW;
@@ -53,41 +55,8 @@ fn uninstall_forwarding_handlers() {
 }
 
 pub fn handle_git(args: &[String]) {
-    // If we're being invoked from a shell completion context, bypass git-ai logic
-    // and delegate directly to the real git so existing completion scripts work.
-    if in_shell_completion_context() {
-        let orig_args: Vec<String> = std::env::args().skip(1).collect();
-        proxy_to_git(&orig_args, true);
-        return;
-    }
-
-    let parsed = parse_git_cli_args(args);
-
-    let is_read_only = parsed.command.as_deref().is_some_and(|cmd| {
-        crate::git::command_classification::is_definitely_read_only_git_invocation(
-            cmd,
-            &parsed.command_args,
-        )
-    });
-
-    if is_read_only {
-        let exit_status = proxy_to_git(args, false);
-        exit_with_status(exit_status);
-    }
-
-    let repository = find_repository(&parsed.global_args).ok();
-    let exit_status = proxy_to_git(args, false);
-
-    // After a successful commit, wait briefly for the daemon to produce an
-    // authorship note so we can show stats inline (same UX as plain wrapper mode).
-    if exit_status.success()
-        && parsed.command.as_deref() == Some("commit")
-        && let Some(repo) = repository.as_ref()
-    {
-        maybe_show_async_post_commit_stats(&parsed, repo);
-    }
-
-    exit_with_status(exit_status);
+    let status = proxy_to_git(args, false);
+    exit_with_status(status);
 }
 
 #[cfg(feature = "test-support")]
@@ -193,108 +162,6 @@ fn parse_alias_tokens(value: &str) -> Option<Vec<String>> {
     }
 
     Some(tokens)
-}
-
-/// In async (wrapper-to-daemon) mode, after a successful `git commit`, poll for
-/// the daemon-produced authorship note and display stats inline when available.
-/// Mirrors the same skip/display rules as plain wrapper mode in post_commit.rs.
-fn maybe_show_async_post_commit_stats(parsed: &ParsedGitInvocation, repo: &Repository) {
-    use crate::authorship::ignore::effective_ignore_patterns;
-    use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
-    use crate::git::cli_parser::is_dry_run;
-    use crate::git::notes_api::read_note;
-    use std::io::IsTerminal;
-
-    // Respect the same suppression flags as the synchronous wrapper path.
-    if is_dry_run(&parsed.command_args) {
-        return;
-    }
-    let suppress_output = parsed.has_command_flag("--porcelain")
-        || parsed.has_command_flag("--quiet")
-        || parsed.has_command_flag("-q")
-        || parsed.has_command_flag("--no-status");
-    if suppress_output || config::Config::get().is_quiet() {
-        return;
-    }
-
-    let is_interactive =
-        std::io::stdout().is_terminal() || std::env::var_os("GIT_AI_TEST_FORCE_TTY").is_some();
-    if !is_interactive {
-        return;
-    }
-
-    // Determine the new commit SHA.
-    let commit_sha = match repo.head().ok().and_then(|h| h.target().ok()) {
-        Some(sha) => sha,
-        None => return,
-    };
-
-    // Use a longer timeout under test to avoid flakiness on saturated CI machines.
-    // GIT_AI_POST_COMMIT_TIMEOUT_MS allows tests to override the timeout.
-    let timeout = if let Some(ms) = std::env::var("GIT_AI_POST_COMMIT_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        std::time::Duration::from_millis(ms)
-    } else if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some() {
-        std::time::Duration::from_secs(20)
-    } else {
-        std::time::Duration::from_millis(500)
-    };
-
-    // Poll for the authorship note the daemon should be producing.
-    let poll_interval = std::time::Duration::from_millis(25);
-    let start = std::time::Instant::now();
-    let note_found = loop {
-        if read_note(repo, &commit_sha).is_some() {
-            break true;
-        }
-        if start.elapsed() >= timeout {
-            break false;
-        }
-        std::thread::sleep(poll_interval);
-    };
-
-    if !note_found {
-        eprintln!(
-            "[git-ai] still processing commit {}... run `git ai stats` to see stats.",
-            &commit_sha[..std::cmp::min(8, commit_sha.len())]
-        );
-        return;
-    }
-
-    // Check if this is a merge commit — skip expensive stats just like the sync path.
-    let is_merge = repo
-        .find_commit(commit_sha.clone())
-        .map(|c| c.parent_count().unwrap_or(0) > 1)
-        .unwrap_or(false);
-    if is_merge {
-        eprintln!(
-            "[git-ai] Skipped git-ai stats for merge commit {}.",
-            commit_sha
-        );
-        return;
-    }
-
-    // Run the same cost estimation the sync path uses.
-    let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
-    if let Ok(estimate) = crate::authorship::post_commit::estimate_stats_cost_for_head(
-        repo,
-        &commit_sha,
-        &ignore_patterns,
-    ) && estimate.should_skip()
-    {
-        eprintln!(
-            "[git-ai] Skipped git-ai stats for large commit. Run `git ai stats {}` to compute stats on demand.",
-            commit_sha
-        );
-        return;
-    }
-
-    // Compute and display the full stats.
-    if let Ok(stats) = stats_for_commit_stats(repo, &commit_sha, &ignore_patterns) {
-        write_stats_to_terminal(&stats, true);
-    }
 }
 
 fn proxy_to_git(args: &[String], exit_on_completion: bool) -> std::process::ExitStatus {
@@ -451,8 +318,3 @@ fn exit_with_status(status: std::process::ExitStatus) -> ! {
 // Detect if current process invocation is coming from shell completion machinery
 // (bash, zsh via bashcompinit). If so, we should proxy directly to the real git
 // without any extra behavior that could interfere with completion scripts.
-fn in_shell_completion_context() -> bool {
-    std::env::var("COMP_LINE").is_ok()
-        || std::env::var("COMP_POINT").is_ok()
-        || std::env::var("COMP_TYPE").is_ok()
-}

@@ -1,7 +1,7 @@
 //! Best-effort installation of Git AI into Windows Subsystem for Linux distros.
 
 #[cfg(windows)]
-use crate::authorship::authorship_log_serialization::GIT_AI_VERSION;
+use crate::version::GIT_AI_VERSION;
 
 #[cfg(any(windows, test))]
 const INSTALL_SCRIPT: &str = "curl -fsSL https://usegitai.com/install.sh | bash";
@@ -118,12 +118,10 @@ fn install_on_windows(config: InstallConfig<'_>) {
 
 #[cfg(any(windows, test))]
 fn decode_wsl_output(bytes: &[u8]) -> String {
-    if bytes.len() >= 2
-        && bytes.len().is_multiple_of(2)
-        && bytes.chunks_exact(2).any(|pair| pair[1] == 0)
-    {
-        let words = bytes
-            .chunks_exact(2)
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if bytes.len() >= 2 && remainder.is_empty() && pairs.iter().any(|pair| pair[1] == 0) {
+        let words = pairs
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16_lossy(&words)

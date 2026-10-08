@@ -1,8 +1,7 @@
-use crate::api::{ApiClient, ApiContext, metrics_upload_allowed};
+use crate::api::{ApiClient, ApiContext};
 use crate::auth::state::AuthStatus;
 use crate::auth::{AuthState, collect_auth_status, format_unix_timestamp};
 use crate::config;
-use crate::metrics::db::{MetricsDatabase, MetricsStatus};
 use std::fmt::Write as _;
 
 pub fn handle_whoami(args: &[String]) {
@@ -27,7 +26,6 @@ pub fn handle_whoami(args: &[String]) {
     let auth = collect_auth_status();
     let api_ctx = ApiContext::new(None);
     let api_client = ApiClient::new(api_ctx.clone());
-    let metrics_status = collect_metrics_status();
 
     print!(
         "{}",
@@ -36,7 +34,6 @@ pub fn handle_whoami(args: &[String]) {
             &auth,
             &api_ctx,
             &api_client,
-            metrics_status.as_ref().map_err(String::as_str),
             telemetry_oss_disabled,
         )
     );
@@ -46,20 +43,11 @@ pub fn handle_whoami(args: &[String]) {
     }
 }
 
-fn collect_metrics_status() -> Result<MetricsStatus, String> {
-    let db = MetricsDatabase::global().map_err(|e| e.to_string())?;
-    let db = db
-        .lock()
-        .map_err(|_| "metrics DB lock poisoned".to_string())?;
-    db.status().map_err(|e| e.to_string())
-}
-
 fn render_whoami(
     api_base_url: &str,
     auth: &AuthStatus,
     api_ctx: &ApiContext,
     api_client: &ApiClient,
-    metrics_status: Result<&MetricsStatus, &str>,
     telemetry_oss_disabled: bool,
 ) -> String {
     let mut out = String::new();
@@ -144,8 +132,12 @@ fn render_whoami(
     writeln!(out, "Telemetry status").unwrap();
     writeln!(
         out,
-        "  Metrics delivery: {}",
-        metrics_delivery_status(api_base_url, api_client)
+        "  Commit-link delivery: {}",
+        if api_client.has_api_key() {
+            "on (API key configured)"
+        } else {
+            "off (requires an API key)"
+        }
     )
     .unwrap();
     writeln!(
@@ -154,12 +146,6 @@ fn render_whoami(
         if telemetry_oss_disabled { "off" } else { "on" }
     )
     .unwrap();
-    match metrics_status {
-        Ok(status) => write_metrics_status(&mut out, status),
-        Err(err) => {
-            writeln!(out, "  Local metrics database: unavailable ({})", err).unwrap();
-        }
-    }
 
     out
 }
@@ -217,42 +203,6 @@ fn login_status(auth: &AuthStatus, api_client: &ApiClient) -> String {
     }
 }
 
-fn metrics_delivery_status(api_base_url: &str, api_client: &ApiClient) -> String {
-    if !metrics_upload_allowed(api_base_url, api_client) {
-        return "off (requires an API key or login)".to_string();
-    }
-
-    match (api_client.has_api_key(), api_client.is_logged_in()) {
-        (true, true) => "on (API key and login connected)".to_string(),
-        (true, false) => "on (API key configured)".to_string(),
-        (false, true) => "on (login connected)".to_string(),
-        (false, false) => unreachable!("metrics_upload_allowed requires auth"),
-    }
-}
-
-fn write_metrics_status(out: &mut String, status: &MetricsStatus) {
-    writeln!(out, "  Local metrics database: ok").unwrap();
-    writeln!(
-        out,
-        "  Events: {} total, {} delivered, {} not delivered",
-        status.total, status.delivered, status.not_delivered
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "  Not delivered: {} pending now, {} waiting for retry, {} processing, {} stopped after errors",
-        status.pending_retryable,
-        status.waiting_retry,
-        status.processing,
-        status.stopped_after_errors
-    )
-    .unwrap();
-    writeln!(out, "  Rows with sync errors: {}", status.rows_with_errors).unwrap();
-    if let Some(latest_error) = &status.latest_error {
-        writeln!(out, "  Latest sync error: {}", latest_error).unwrap();
-    }
-}
-
 fn optional_or_unavailable(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("<unavailable>")
 }
@@ -273,164 +223,4 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  git-ai whoami");
     eprintln!("  git-ai whoami --help");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::identity::TokenOrg;
-
-    fn auth_status(state: AuthState) -> AuthStatus {
-        AuthStatus {
-            backend: "test-backend".to_string(),
-            state,
-            access_token_expires_at: None,
-            refresh_token_expires_at: None,
-            user_id: None,
-            email: None,
-            name: None,
-            personal_org_id: None,
-            orgs: Vec::new(),
-        }
-    }
-
-    fn api_context(
-        base_url: &str,
-        api_key: Option<&str>,
-        auth_token: Option<&str>,
-        author_identity: Option<&str>,
-    ) -> ApiContext {
-        ApiContext {
-            base_url: base_url.to_string(),
-            auth_token: auth_token.map(str::to_string),
-            api_key: api_key.map(str::to_string),
-            author_identity: author_identity.map(str::to_string),
-            timeout_secs: Some(30),
-        }
-    }
-
-    fn metrics_status() -> MetricsStatus {
-        MetricsStatus {
-            total: 12,
-            delivered: 8,
-            not_delivered: 4,
-            pending_retryable: 2,
-            waiting_retry: 1,
-            processing: 1,
-            stopped_after_errors: 0,
-            rows_with_errors: 1,
-            latest_error: Some("temporary outage".to_string()),
-        }
-    }
-
-    #[test]
-    fn render_whoami_treats_api_key_only_as_connected() {
-        let auth = auth_status(AuthState::LoggedOut);
-        let ctx = api_context(
-            crate::config::DEFAULT_API_BASE_URL,
-            Some("gitai_test_1234567890"),
-            None,
-            Some("Alice Example <alice@example.com>"),
-        );
-        let client = ApiClient::new(ctx.clone());
-        let metrics = metrics_status();
-
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
-
-        assert!(output.contains("API access: connected via API key"));
-        assert!(output.contains("API key: configured (gita...7890)"));
-        assert!(output.contains("Login: optional (using api key)"));
-        assert!(output.contains("Identity: Alice Example <alice@example.com>"));
-        assert!(!output.contains("Author identity header"));
-        assert!(!output.contains("Login identity"));
-        assert!(output.contains("Telemetry status"));
-        assert!(!output.contains("Telemetry and metrics"));
-        assert!(output.contains("Metrics delivery: on (API key configured)"));
-    }
-
-    #[test]
-    fn render_whoami_shows_login_identity_and_metrics_summary() {
-        let mut auth = auth_status(AuthState::LoggedIn);
-        auth.user_id = Some("user-123".to_string());
-        auth.email = Some("user@example.com".to_string());
-        auth.name = Some("User Example".to_string());
-        auth.personal_org_id = Some("org-123".to_string());
-        auth.orgs = vec![TokenOrg {
-            org_id: Some("org-123".to_string()),
-            org_slug: Some("acme".to_string()),
-            org_name: Some("Acme".to_string()),
-            role: Some("owner".to_string()),
-        }];
-        let ctx = api_context(
-            crate::config::DEFAULT_API_BASE_URL,
-            None,
-            Some("access-token"),
-            None,
-        );
-        let client = ApiClient::new(ctx.clone());
-        let metrics = metrics_status();
-
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), true);
-
-        assert!(output.contains("API access: connected via login"));
-        assert!(output.contains("API key: unset"));
-        assert!(output.contains("Login: logged in"));
-        assert!(output.contains("Identity: not sent"));
-        assert!(!output.contains("Author identity header"));
-        assert!(output.contains("Login identity"));
-        assert!(output.contains("Email: user@example.com"));
-        assert!(output.contains("- acme (Acme) [org-123] role=owner"));
-        assert!(output.contains("Telemetry status"));
-        assert!(!output.contains("Telemetry and metrics"));
-        assert!(output.contains("OSS diagnostic telemetry: off"));
-        assert!(output.contains("Events: 12 total, 8 delivered, 4 not delivered"));
-        assert!(output.contains("Rows with sync errors: 1"));
-        assert!(output.contains("Latest sync error: temporary outage"));
-    }
-
-    #[test]
-    fn render_whoami_shows_unset_api_key_and_not_logged_in() {
-        let auth = auth_status(AuthState::LoggedOut);
-        let ctx = api_context(crate::config::DEFAULT_API_BASE_URL, None, None, None);
-        let client = ApiClient::new(ctx.clone());
-        let metrics = metrics_status();
-
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
-
-        assert!(output.contains("API key: unset"));
-        assert!(output.contains("Login: not logged in"));
-    }
-
-    #[test]
-    fn should_exit_failure_preserves_stored_login_success() {
-        let logged_out = auth_status(AuthState::LoggedOut);
-        let logged_in = auth_status(AuthState::LoggedIn);
-        let no_token_no_key = api_context(crate::config::DEFAULT_API_BASE_URL, None, None, None);
-        let no_token_with_key = api_context(
-            crate::config::DEFAULT_API_BASE_URL,
-            Some("gitai_test_1234567890"),
-            None,
-            Some("Alice Example <alice@example.com>"),
-        );
-
-        assert!(should_exit_failure(&logged_out, &no_token_no_key));
-        assert!(!should_exit_failure(&logged_out, &no_token_with_key));
-        assert!(!should_exit_failure(&logged_in, &no_token_no_key));
-    }
-
-    #[test]
-    fn render_whoami_distinguishes_login_credentials_from_usable_token() {
-        let auth = auth_status(AuthState::LoggedIn);
-        let ctx = api_context(crate::config::DEFAULT_API_BASE_URL, None, None, None);
-        let client = ApiClient::new(ctx.clone());
-        let metrics = metrics_status();
-
-        let output = render_whoami(&ctx.base_url, &auth, &ctx, &client, Ok(&metrics), false);
-
-        assert!(output.contains(
-            "API access: not connected (login credentials found, but no usable access token)"
-        ));
-        assert!(output.contains("Login: logged in"));
-        assert!(output.contains("Metrics delivery: off (requires an API key or login)"));
-    }
 }

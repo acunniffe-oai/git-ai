@@ -108,52 +108,18 @@ type MutatingCall = {
   toolNameRaw: string;
   toolName: CanonicalToolName;
   filepaths: string[];
-  toolInput: unknown;
 };
 
 type CheckpointPayload = {
   hook_event_name: HookEventName;
   session_id: string;
-  session_path: string;
   cwd: string;
-  model: string;
   tool_name: CanonicalToolName;
   tool_name_raw: string;
   tool_use_id?: string;
-  dirty_files?: Record<string, string>;
-  will_edit_filepaths?: string[];
   edited_filepaths?: string[];
-  tool_input?: unknown;
-  tool_result?: unknown;
+  command?: string;
 };
-
-async function readSessionLines(sessionPath: string): Promise<string[]> {
-  const content = await readFile(sessionPath, 'utf8');
-  return content.split(/\r?\n/).filter((line) => line.trim().length > 0);
-}
-
-async function readSessionId(sessionPath: string): Promise<string | undefined> {
-  const lines = await readSessionLines(sessionPath);
-  const header = JSON.parse(lines[0] ?? '{}');
-  if (header?.type === 'session' && typeof header.id === 'string' && header.id.trim().length > 0) {
-    return header.id;
-  }
-  return undefined;
-}
-
-async function readLatestAssistantModel(sessionPath: string): Promise<string> {
-  const lines = await readSessionLines(sessionPath);
-  let latestModel = '';
-
-  for (const line of lines) {
-    const entry = JSON.parse(line);
-    if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') continue;
-    const model = typeof entry.message.model === 'string' ? entry.message.model : '';
-    if (model) latestModel = model;
-  }
-
-  return latestModel;
-}
 
 function resolveAbsolutePath(cwd: string, pathValue: string): string {
   return isAbsolute(pathValue) ? pathValue : resolve(cwd, pathValue);
@@ -202,7 +168,7 @@ function toMutatingCall(
   );
   if (filepaths.length === 0) return undefined;
 
-  return { toolNameRaw, toolName: policy.canonical, filepaths, toolInput: input };
+  return { toolNameRaw, toolName: policy.canonical, filepaths };
 }
 
 function extractMutatingCalls(
@@ -227,22 +193,6 @@ function extractMutatingCalls(
   return direct ? [direct] : [];
 }
 
-async function readDirtyFiles(filepaths: string[]): Promise<Record<string, string>> {
-  const dirtyFiles: Record<string, string> = {};
-
-  await Promise.all(
-    filepaths.map(async (filepath) => {
-      try {
-        dirtyFiles[filepath] = await readFile(filepath, 'utf8');
-      } catch {
-        dirtyFiles[filepath] = '';
-      }
-    }),
-  );
-
-  return dirtyFiles;
-}
-
 async function runCheckpoint(payload: CheckpointPayload): Promise<void> {
   await new Promise<void>((resolvePromise) => {
     const child = spawn(GIT_AI_BIN, ['checkpoint', 'pi', '--hook-input', 'stdin'], {
@@ -256,125 +206,45 @@ async function runCheckpoint(payload: CheckpointPayload): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
-  const pendingCalls = new Map<string, MutatingCall[]>();
-  const pendingBashCalls = new Set<string>();
+  const pendingCalls = new Map<string, { sessionId: string; cwd: string; calls: MutatingCall[] }>();
+  const pendingBashCalls = new Map<string, { sessionId: string; cwd: string; command?: string }>();
   const toolConfigPromise = buildToolConfig();
 
   pi.on('tool_call', async (event, ctx) => {
-    const sessionPath = ctx.sessionManager.getSessionFile();
-    if (!sessionPath) return;
-
-    // Bash tool path — snapshot system handles filesystem diffing
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!sessionId) return;
     if (event.toolName === 'bash') {
-      const sessionId = await readSessionId(sessionPath).catch(() => undefined);
-      if (!sessionId) return;
-      const model = await readLatestAssistantModel(sessionPath).catch(() => '');
-      pendingBashCalls.add(event.toolCallId);
+      const command = typeof event.input?.command === 'string' ? event.input.command : undefined;
+      pendingBashCalls.set(event.toolCallId, { sessionId, cwd: ctx.cwd, command });
       await runCheckpoint({
-        hook_event_name: 'before_command',
-        session_id: sessionId,
-        session_path: sessionPath,
-        cwd: ctx.cwd,
-        model,
-        tool_name: 'bash',
-        tool_name_raw: event.toolName,
-        tool_use_id: event.toolCallId,
+        hook_event_name: 'before_command', session_id: sessionId, cwd: ctx.cwd,
+        tool_name: 'bash', tool_name_raw: event.toolName, tool_use_id: event.toolCallId, command,
       });
       return;
     }
-
-    // File-edit tool path (existing logic)
-    const mutatingCalls = extractMutatingCalls(
-      ctx.cwd,
-      event.toolName,
-      event.input,
-      await toolConfigPromise,
-    );
-    if (mutatingCalls.length === 0) return;
-
-    const sessionId = await readSessionId(sessionPath).catch(() => undefined);
-    if (!sessionId) return;
-
-    const model = await readLatestAssistantModel(sessionPath).catch(() => '');
-    pendingCalls.set(event.toolCallId, mutatingCalls);
-
-    for (const call of mutatingCalls) {
-      await runCheckpoint({
-        hook_event_name: 'before_edit',
-        session_id: sessionId,
-        session_path: sessionPath,
-        cwd: ctx.cwd,
-        model,
-        tool_name: call.toolName,
-        tool_name_raw: call.toolNameRaw,
-        will_edit_filepaths: call.filepaths,
-        dirty_files: await readDirtyFiles(call.filepaths),
-        tool_input: call.toolInput,
-      });
-    }
+    const calls = extractMutatingCalls(ctx.cwd, event.toolName, event.input, await toolConfigPromise);
+    if (calls.length > 0) pendingCalls.set(event.toolCallId, { sessionId, cwd: ctx.cwd, calls });
   });
 
-  pi.on('tool_result', async (event, ctx) => {
-    // Bash tool result path
-    if (pendingBashCalls.has(event.toolCallId)) {
+  pi.on('tool_result', async (event) => {
+    const shell = pendingBashCalls.get(event.toolCallId);
+    if (shell) {
       pendingBashCalls.delete(event.toolCallId);
-      if (event.isError) return;
-      const sessionPath = ctx.sessionManager.getSessionFile();
-      if (!sessionPath) return;
-      const sessionId = await readSessionId(sessionPath).catch(() => undefined);
-      if (!sessionId) return;
-      const model = await readLatestAssistantModel(sessionPath).catch(() => '');
+      // A failed shell command can still have made writes before failing.
       await runCheckpoint({
-        hook_event_name: 'after_command',
-        session_id: sessionId,
-        session_path: sessionPath,
-        cwd: ctx.cwd,
-        model,
-        tool_name: 'bash',
-        tool_name_raw: 'bash',
-        tool_use_id: event.toolCallId,
+        hook_event_name: 'after_command', session_id: shell.sessionId, cwd: shell.cwd,
+        tool_name: 'bash', tool_name_raw: 'bash', tool_use_id: event.toolCallId, command: shell.command,
       });
       return;
     }
-
-    // File-edit tool result path (existing logic)
-    if (event.isError) {
-      pendingCalls.delete(event.toolCallId);
-      return;
-    }
-
-    const sessionPath = ctx.sessionManager.getSessionFile();
-    if (!sessionPath) {
-      pendingCalls.delete(event.toolCallId);
-      return;
-    }
-
-    const mutatingCalls = pendingCalls.get(event.toolCallId) ?? [];
+    const pending = pendingCalls.get(event.toolCallId);
     pendingCalls.delete(event.toolCallId);
-    if (mutatingCalls.length === 0) return;
-
-    const sessionId = await readSessionId(sessionPath).catch(() => undefined);
-    if (!sessionId) return;
-
-    const model = await readLatestAssistantModel(sessionPath).catch(() => '');
-
-    for (const call of mutatingCalls) {
+    if (!pending || event.isError) return;
+    for (const call of pending.calls) {
       await runCheckpoint({
-        hook_event_name: 'after_edit',
-        session_id: sessionId,
-        session_path: sessionPath,
-        cwd: ctx.cwd,
-        model,
-        tool_name: call.toolName,
-        tool_name_raw: call.toolNameRaw,
-        edited_filepaths: call.filepaths,
-        dirty_files: await readDirtyFiles(call.filepaths),
-        tool_input: call.toolInput,
-        tool_result: {
-          content: event.content,
-          details: event.details,
-          isError: event.isError,
-        },
+        hook_event_name: 'after_edit', session_id: pending.sessionId, cwd: pending.cwd,
+        tool_name: call.toolName, tool_name_raw: call.toolNameRaw,
+        tool_use_id: event.toolCallId, edited_filepaths: call.filepaths,
       });
     }
   });

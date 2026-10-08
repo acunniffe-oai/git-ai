@@ -2,7 +2,6 @@
 #[path = "integration/repos/mod.rs"]
 mod repos;
 
-use git_ai::daemon::control_api::CasSyncPayload;
 use git_ai::daemon::{
     ControlRequest, ControlResponse, DaemonConfig, TelemetryEnvelope,
     local_socket_connects_with_timeout, open_local_socket_stream_with_timeout,
@@ -341,8 +340,9 @@ fn async_mode_checkpoint_starts_daemon_when_down() {
     )
     .expect("failed to write async checkpoint file");
 
+    let hook = serde_json::json!({"session_id":"async-session","cwd":repo.path(),"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"file_path":repo.path().join("async-checkpoint.txt")}});
     let output = repo
-        .git_ai(&["checkpoint", "mock_ai", "async-checkpoint.txt"])
+        .git_ai(&["checkpoint", "claude", "--hook-input", &hook.to_string()])
         .expect("async mode checkpoint should succeed");
 
     assert!(
@@ -529,7 +529,7 @@ fn wait_for_control_connection_close<R: Read>(reader: &mut BufReader<R>, timeout
 /// daemon acknowledges each request with `ok: true` without closing the
 /// connection between requests.
 #[test]
-fn daemon_telemetry_and_cas_over_persistent_connection() {
+fn daemon_telemetry_over_persistent_connection() {
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
 
     // Start the daemon
@@ -571,24 +571,6 @@ fn daemon_telemetry_and_cas_over_persistent_connection() {
     // between sparse events. It must survive beyond the checkpoint body
     // receive timeout, which does not apply to ordinary control traffic.
     thread::sleep(Duration::from_millis(2_500));
-
-    // 2. Send CAS payloads over the *same* connection
-    let cas_req = ControlRequest::SubmitCas {
-        records: vec![
-            CasSyncPayload {
-                hash: "abc123".to_string(),
-                data: "test cas data".to_string(),
-                metadata: None,
-            },
-            CasSyncPayload {
-                hash: "def456".to_string(),
-                data: "more cas data".to_string(),
-                metadata: Some("test-meta".to_string()),
-            },
-        ],
-    };
-    let resp = send_on_persistent_conn(&mut reader, &cas_req);
-    assert!(resp.ok, "CAS submit should succeed: {:?}", resp.error);
 
     // 3. Send another batch of telemetry to confirm the connection stays alive
     let telemetry_req2 = ControlRequest::SubmitTelemetry {

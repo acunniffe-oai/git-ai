@@ -1,13 +1,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::metrics::MetricEvent;
-
-pub mod performance_targets;
-
-/// Maximum events per metrics envelope
-pub const MAX_METRICS_PER_ENVELOPE: usize = 1000;
-
 /// Submit telemetry envelopes via the best available path:
 /// 1. External daemon control socket (wrapper processes)
 /// 2. In-process daemon telemetry worker (daemon process itself)
@@ -57,30 +50,6 @@ pub fn log_message(message: &str, level: &str, context: Option<serde_json::Value
         context,
     };
     submit_telemetry_envelope(vec![envelope]);
-}
-
-/// Log a batch of metric events (via daemon telemetry worker).
-///
-/// Events are batched into envelopes of up to 1000 events each.
-pub fn log_metrics(events: Vec<MetricEvent>) {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        if std::env::var_os("GIT_AI_TEST_METRICS_DB_PATH").is_none() {
-            return;
-        }
-    }
-
-    if events.is_empty() {
-        return;
-    }
-
-    // Split into chunks of MAX_METRICS_PER_ENVELOPE
-    for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
-        let envelope = crate::daemon::TelemetryEnvelope::Metrics {
-            events: chunk.to_vec(),
-        };
-        submit_telemetry_envelope(vec![envelope]);
-    }
 }
 
 #[cfg(test)]
@@ -143,17 +112,5 @@ mod tests {
     #[test]
     fn test_log_message_warning() {
         log_message("warning message", "warning", None);
-    }
-
-    // Test metrics logging
-    #[test]
-    fn test_log_metrics_empty() {
-        log_metrics(vec![]);
-    }
-
-    // Test constants
-    #[test]
-    fn test_max_metrics_per_envelope() {
-        assert_eq!(MAX_METRICS_PER_ENVELOPE, 1000);
     }
 }

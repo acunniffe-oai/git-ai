@@ -108,14 +108,6 @@ pub fn is_interactive_terminal() -> bool {
     *IS_TERMINAL.get_or_init(|| std::io::stdin().is_terminal())
 }
 
-/// Returns true if the process is running inside a background AI agent environment.
-pub fn is_in_background_agent() -> bool {
-    !matches!(
-        crate::authorship::background_agent::detect(),
-        crate::authorship::background_agent::BackgroundAgent::None
-    )
-}
-
 /// Returns true if the current process is running with elevated privileges
 /// (root on Unix, Administrator on Windows).
 #[cfg(unix)]

@@ -144,13 +144,6 @@ impl TmpRepo {
         self.git_command(&["rebase", onto])?;
         Ok(())
     }
-
-    /// Bench-only no-op stub; preserved for API compatibility with callers that
-    /// previously triggered a `git-ai checkpoint` here. Benchmarks that need
-    /// real attribution data should pre-write notes via `notes_add`.
-    pub fn trigger_checkpoint_with_author(&self, _author: &str) -> Result<(), GitAiError> {
-        Ok(())
-    }
 }
 
 fn run_git_in(cwd: &Path, args: &[&str]) -> Result<String, GitAiError> {

@@ -1,10 +1,12 @@
 use crate::error::GitAiError;
-use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
+use crate::mdm::hook_installer::{
+    HookCheckResult, HookInstaller, HookInstallerParams, InstallResult,
+};
 use crate::mdm::utils::{
     MIN_CODE_VERSION, generate_diff, get_editor_version, home_dir,
     normalize_windows_path_for_shell, parse_version, resolve_editor_cli,
-    settings_paths_for_products, should_process_settings_target, version_meets_requirement,
-    write_atomic,
+    settings_paths_for_products, should_process_settings_target, update_vscode_chat_hook_settings,
+    version_meets_requirement, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -104,6 +106,28 @@ impl HookInstaller for GitHubCopilotInstaller {
 
     fn configure_otel(&self, agent: &Value, dry_run: bool) -> Result<Option<String>, GitAiError> {
         crate::mdm::copilot_otel::configure(agent, dry_run)
+    }
+
+    fn install_extras(
+        &self,
+        _params: &HookInstallerParams,
+        dry_run: bool,
+    ) -> Result<Vec<InstallResult>, GitAiError> {
+        Self::settings_targets()
+            .into_iter()
+            .filter(|path| should_process_settings_target(path))
+            .map(|path| {
+                let diff = update_vscode_chat_hook_settings(&path, dry_run)?;
+                Ok(InstallResult {
+                    changed: diff.is_some(),
+                    diff,
+                    message: format!(
+                        "GitHub Copilot: native chat hooks configured in {}",
+                        path.display()
+                    ),
+                })
+            })
+            .collect()
     }
 
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {

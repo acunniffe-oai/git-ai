@@ -4,6 +4,20 @@
 //! rand dependency. We only need random UUIDs, so we don't need a full UUID
 //! library with parsing, other versions, etc.
 
+/// Short random identifier for a hook request, preserving the established wire format.
+pub fn generate_trace_id() -> String {
+    use rand::RngExt;
+
+    let mut rng = rand::rng();
+    let hex: String = (0..14)
+        .map(|_| {
+            let idx: u8 = rng.random_range(0..16);
+            char::from_digit(idx as u32, 16).unwrap()
+        })
+        .collect();
+    format!("t_{}", hex)
+}
+
 /// Generate a random UUID v4 (RFC 4122).
 ///
 /// Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx

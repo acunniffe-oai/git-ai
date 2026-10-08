@@ -4,10 +4,9 @@ use crate::error::GitAiError;
 use crate::mdm::agent_otel::ClientConfiguration;
 use crate::mdm::agents::get_all_installers;
 use crate::mdm::hook_installer::HookInstallerParams;
-use crate::mdm::skills_installer;
 use crate::mdm::spinner::{Spinner, print_diff};
 use crate::mdm::utils::get_current_binary_path;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,14 +14,11 @@ use std::process::{Command, Stdio};
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "0";
-const VISUAL_STUDIO_INSTALLER_ID: &str = "visual-studio";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct InstallOptions {
     dry_run: bool,
     verbose: bool,
-    install_skills: bool,
-    include_visual_studio_extension: bool,
     configure_env: bool,
     configure_wsl: bool,
     api_base: Option<String>,
@@ -54,7 +50,7 @@ impl InstallStatus {
     }
 }
 
-/// Detailed install result for metrics tracking
+/// Detailed install result for operational diagnostics
 #[derive(Debug, Clone)]
 pub struct InstallResult {
     pub status: InstallStatus,
@@ -101,8 +97,8 @@ impl InstallResult {
         self
     }
 
-    /// Get message for ClickHouse (error if failed, else joined warnings)
-    pub fn message_for_metrics(&self) -> Option<String> {
+    /// Get diagnostic message (error if failed, else joined warnings)
+    pub fn message_for_diagnostics(&self) -> Option<String> {
         if let Some(err) = &self.error {
             Some(err.clone())
         } else if !self.warnings.is_empty() {
@@ -372,7 +368,7 @@ fn run_hooks_install(options: &InstallOptions) -> Result<HashMap<String, String>
     ensure_daemon(options.dry_run);
 
     // Now that the daemon is (re)started, initialize the telemetry handle so
-    // that install-hooks metrics and observability events route through it.
+    // that installation diagnostics route through it.
     if !options.dry_run {
         let _ = crate::daemon::telemetry_handle::init_daemon_telemetry_handle();
     }
@@ -425,8 +421,9 @@ fn parse_install_options(args: &[String]) -> Result<InstallOptions, GitAiError> 
         match arg.as_str() {
             "--dry-run" | "--dry-run=true" => options.dry_run = true,
             "--verbose" | "-v" => options.verbose = true,
-            "--skills" => options.install_skills = true,
-            "--visual-studio-extension" => options.include_visual_studio_extension = true,
+            "--skills" | "--visual-studio-extension" => {
+                return Err(GitAiError::Generic(format!("{arg} is no longer supported")));
+            }
             "--env" | "--env=true" => options.configure_env = true,
             "--wsl" | "--wsl=true" => options.configure_wsl = true,
             value if value.starts_with("--api-base=") => {
@@ -457,10 +454,6 @@ fn parse_install_options(args: &[String]) -> Result<InstallOptions, GitAiError> 
 fn non_empty_value(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
-}
-
-fn should_include_installer(id: &str, options: &InstallOptions) -> bool {
-    options.include_visual_studio_extension || id != VISUAL_STUDIO_INSTALLER_ID
 }
 
 #[derive(Default)]
@@ -596,24 +589,19 @@ async fn async_run_install(
     let mut any_checked = false;
     let mut has_changes = false;
     let mut statuses: HashMap<String, InstallStatus> = HashMap::new();
-    // Track detailed results for metrics (tool_id, result)
+    // Track detailed results for diagnostics (tool_id, result)
     let mut detailed_results: Vec<(String, InstallResult)> = Vec::new();
 
     // === Coding Agents ===
     println!("\n\x1b[1mCoding Agents\x1b[0m");
 
     let installers = get_all_installers();
-    let mut installed_tools: HashSet<String> = HashSet::new();
     // Track agents whose hooks were updated (name, process_names) for restart warnings
     let mut updated_agents: Vec<(String, Vec<String>)> = Vec::new();
 
     for installer in &installers {
         let name = installer.name();
         let id = installer.id();
-
-        if !should_include_installer(id, options) {
-            continue;
-        }
 
         // Check if tool is installed and hooks status
         match installer.check_hooks(params) {
@@ -624,7 +612,6 @@ async fn async_run_install(
                     continue;
                 }
 
-                installed_tools.insert(id.to_string());
                 any_checked = true;
 
                 // Install/update hooks (only for tools that use config file hooks)
@@ -783,7 +770,7 @@ async fn async_run_install(
                             }
                         }
 
-                        // Track restart detection for extras-only agents (e.g. JetBrains, VS Code)
+                        // Track restart detection for agents with additional native settings
                         if extras_changed
                             && !options.dry_run
                             && !updated_agents.iter().any(|(n, _)| n == name)
@@ -821,19 +808,6 @@ async fn async_run_install(
                 detailed_results.push((id.to_string(), InstallResult::failed(error_msg)));
             }
         }
-    }
-
-    if options.install_skills {
-        if let Ok(result) =
-            skills_installer::install_skills(options.dry_run, options.verbose, &installed_tools)
-            && result.changed
-        {
-            has_changes = true;
-        }
-    } else if let Ok(result) = skills_installer::uninstall_skills(options.dry_run, options.verbose)
-        && result.changed
-    {
-        has_changes = true;
     }
 
     if !any_checked {
@@ -890,7 +864,7 @@ async fn async_run_install(
 
     // Emit metrics for each agent/git_client result (only if not dry-run)
     if !options.dry_run {
-        emit_install_hooks_metrics(&detailed_results);
+        emit_install_hooks_diagnostics(&detailed_results);
     }
 
     // Warn if git version is below the minimum required for full functionality
@@ -964,24 +938,18 @@ fn warn_if_git_version_too_old() {
     }
 }
 
-/// Emit metrics events for install-hooks results
-fn emit_install_hooks_metrics(results: &[(String, InstallResult)]) {
-    use crate::metrics::{EventAttributes, InstallHooksValues};
-
-    let attrs = EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
-
+/// Record operational installation outcomes without the legacy metrics pipeline.
+fn emit_install_hooks_diagnostics(results: &[(String, InstallResult)]) {
     for (tool_id, result) in results {
-        let mut values = InstallHooksValues::new()
-            .tool_id(tool_id.clone())
-            .status(result.status.as_str().to_string());
-
-        if let Some(msg) = result.message_for_metrics() {
-            values = values.message(msg);
-        } else {
-            values = values.message_null();
-        }
-
-        crate::metrics::record(values, attrs.clone());
+        crate::observability::log_message(
+            "agent_hooks_install",
+            "info",
+            Some(serde_json::json!({
+                "tool_id": tool_id,
+                "status": result.status.as_str(),
+                "message": result.message_for_diagnostics(),
+            })),
+        );
     }
 }
 
@@ -993,16 +961,6 @@ async fn async_run_uninstall(
     let mut any_checked = false;
     let mut has_changes = false;
     let mut statuses: HashMap<String, InstallStatus> = HashMap::new();
-
-    // Uninstall skills first (these are global, not per-agent, silently)
-    if let Ok(result) = skills_installer::uninstall_skills(dry_run, verbose) {
-        if result.changed {
-            has_changes = true;
-            statuses.insert("skills".to_string(), InstallStatus::Installed);
-        } else {
-            statuses.insert("skills".to_string(), InstallStatus::AlreadyInstalled);
-        }
-    }
 
     // === Coding Agents ===
     println!("\n\x1b[1mCoding Agents\x1b[0m");
@@ -1198,38 +1156,6 @@ mod tests {
         {
             std::os::unix::fs::symlink(git_path, install_dir.join("git-og")).unwrap();
         }
-    }
-
-    #[test]
-    fn parse_install_options_defaults_visual_studio_extension_to_disabled() {
-        let options = parse_install_options(&[]).unwrap();
-
-        assert!(!options.include_visual_studio_extension);
-        assert!(!should_include_installer(
-            VISUAL_STUDIO_INSTALLER_ID,
-            &options
-        ));
-        assert!(should_include_installer("vscode", &options));
-    }
-
-    #[test]
-    fn parse_install_options_enables_visual_studio_extension_flag() {
-        let args = vec![
-            "--dry-run".to_string(),
-            "--visual-studio-extension".to_string(),
-            "--skills".to_string(),
-            "-v".to_string(),
-        ];
-        let options = parse_install_options(&args).unwrap();
-
-        assert!(options.dry_run);
-        assert!(options.verbose);
-        assert!(options.install_skills);
-        assert!(options.include_visual_studio_extension);
-        assert!(should_include_installer(
-            VISUAL_STUDIO_INSTALLER_ID,
-            &options
-        ));
     }
 
     #[test]

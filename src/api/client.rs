@@ -121,25 +121,21 @@ pub fn clear_git_identity_cache_for_tests() {
     }
 }
 
-/// Resolve the git-ai effective author identity without requiring a Repository instance.
+/// Resolve Git's effective identity without requiring a Repository instance.
 ///
 /// Uses the shared git identity helper to get the current user's identity,
 /// respecting the full git precedence chain (env vars > config > system defaults),
-/// then overlays any configured git-ai author fields.
 /// Falls back to the system hostname if git identity is unavailable.
 ///
-/// The underlying git/fallback identity is cached for [`GIT_IDENTITY_CACHE_TTL`];
-/// the git-ai author config overlay is re-applied on every call so config
-/// overrides keep propagating quickly.
+/// The underlying identity is cached for [`GIT_IDENTITY_CACHE_TTL`].
 fn resolve_git_identity() -> Option<String> {
-    let author_config = config::Config::fresh_author_cached();
-    let identity = cached_git_committer_identity().with_author_config(&author_config);
+    let identity = cached_git_committer_identity();
     if let Some(formatted) = identity.formatted() {
         return Some(encode_for_header(&formatted));
     }
 
     cached_fallback_identity()
-        .map(|id| parse_git_var_identity(&id).with_author_config(&author_config))
+        .map(|id| parse_git_var_identity(&id))
         .and_then(|identity| identity.formatted())
         .map(|id| encode_for_header(&id))
 }
@@ -357,8 +353,8 @@ impl ApiContext {
     /// Build the full URL for an endpoint.
     ///
     /// The endpoint is appended to the base URL preserving any path prefix on
-    /// the base — i.e. `https://host/api/gitai` + `/worker/notes/upload`
-    /// yields `https://host/api/gitai/worker/notes/upload`. Leading/trailing
+    /// the base — i.e. `https://host/api/gitai` + `/worker/logs/upload`
+    /// yields `https://host/api/gitai/worker/logs/upload`. Leading/trailing
     /// slashes are normalized so the join works regardless of which side
     /// carries the separator.
     fn build_url(&self, endpoint: &str) -> Result<String, GitAiError> {
@@ -543,24 +539,24 @@ mod tests {
     #[test]
     fn test_build_url_preserves_path_prefix() {
         let ctx = ApiContext::without_auth(Some("https://example.com/api/gitai".to_string()));
-        let url = ctx.build_url("/worker/notes/upload").unwrap();
-        assert_eq!(url, "https://example.com/api/gitai/worker/notes/upload");
+        let url = ctx.build_url("/worker/logs/upload").unwrap();
+        assert_eq!(url, "https://example.com/api/gitai/worker/logs/upload");
     }
 
     #[test]
     fn test_build_url_preserves_path_prefix_with_trailing_slash() {
         let ctx = ApiContext::without_auth(Some("https://example.com/api/gitai/".to_string()));
-        let url = ctx.build_url("/worker/notes/upload").unwrap();
-        assert_eq!(url, "https://example.com/api/gitai/worker/notes/upload");
+        let url = ctx.build_url("/worker/logs/upload").unwrap();
+        assert_eq!(url, "https://example.com/api/gitai/worker/logs/upload");
     }
 
     #[test]
     fn test_build_url_preserves_query_string() {
         let ctx = ApiContext::without_auth(Some("https://example.com/api/gitai".to_string()));
-        let url = ctx.build_url("/worker/notes/?commits=abc,def").unwrap();
+        let url = ctx.build_url("/worker/logs/?kinds=log,heartbeat").unwrap();
         assert_eq!(
             url,
-            "https://example.com/api/gitai/worker/notes/?commits=abc,def"
+            "https://example.com/api/gitai/worker/logs/?kinds=log,heartbeat"
         );
     }
 
@@ -671,12 +667,7 @@ mod tests {
 
     fn reset_identity_caches() {
         clear_git_identity_cache_for_tests();
-        config::Config::clear_author_config_cache_for_tests();
     }
-
-    /// Neutralizes any developer-machine git-ai author config for the test.
-    const EMPTY_AUTHOR_PATCH: (&str, Option<&str>) =
-        ("GIT_AI_TEST_CONFIG_PATCH", Some(r#"{"author": {}}"#));
 
     #[test]
     fn test_cached_with_ttl_resolves_once_within_ttl() {
@@ -718,7 +709,6 @@ mod tests {
     fn test_resolve_git_identity_caches_git_identity_within_ttl() {
         with_env_vars(
             &[
-                EMPTY_AUTHOR_PATCH,
                 ("GIT_COMMITTER_NAME", Some("Alice")),
                 ("GIT_COMMITTER_EMAIL", Some("alice@example.com")),
             ],
@@ -747,7 +737,6 @@ mod tests {
     fn test_clear_git_identity_cache_picks_up_new_identity() {
         with_env_vars(
             &[
-                EMPTY_AUTHOR_PATCH,
                 ("GIT_COMMITTER_NAME", Some("Alice")),
                 ("GIT_COMMITTER_EMAIL", Some("alice@example.com")),
             ],
@@ -766,40 +755,6 @@ mod tests {
                 assert_eq!(
                     resolve_git_identity().as_deref(),
                     Some("Bob <bob@example.com>")
-                );
-            },
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_author_config_overlay_applies_over_cached_identity() {
-        with_env_vars(
-            &[
-                EMPTY_AUTHOR_PATCH,
-                ("GIT_COMMITTER_NAME", Some("Alice")),
-                ("GIT_COMMITTER_EMAIL", Some("alice@example.com")),
-            ],
-            || {
-                reset_identity_caches();
-                assert_eq!(
-                    resolve_git_identity().as_deref(),
-                    Some("Alice <alice@example.com>")
-                );
-
-                // The base git identity stays cached (env change invisible), but
-                // a git-ai author config override must apply immediately.
-                unsafe {
-                    std::env::set_var("GIT_COMMITTER_NAME", "Bob");
-                    std::env::set_var("GIT_COMMITTER_EMAIL", "bob@example.com");
-                    std::env::set_var(
-                        "GIT_AI_TEST_CONFIG_PATCH",
-                        r#"{"author": {"name": "Config User"}}"#,
-                    );
-                }
-                assert_eq!(
-                    resolve_git_identity().as_deref(),
-                    Some("Config User <alice@example.com>")
                 );
             },
         );

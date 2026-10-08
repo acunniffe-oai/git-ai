@@ -2,15 +2,10 @@
 #[path = "integration/repos/mod.rs"]
 mod repos;
 
-use git_ai::authorship::working_log::AgentId;
-use git_ai::authorship::working_log::CheckpointKind;
-use git_ai::commands::checkpoint_agent::orchestrator::{
-    BaseCommit, CheckpointFile, CheckpointRequest,
-};
-use git_ai::config::{NotesBackendConfig, NotesBackendKind};
+use git_ai::commit_links::checkpoint::{CheckpointSignal, LinkCheckpoint};
+use git_ai::commit_links::store::{LinkStore, SessionIdentity};
 #[cfg(not(windows))]
 use git_ai::daemon::ControlResponse;
-use git_ai::daemon::checkpoint::PreparedPathRole;
 use git_ai::daemon::send_checkpoint_request_with_timeout;
 use git_ai::daemon::send_control_request_with_timeout;
 use git_ai::daemon::{
@@ -18,18 +13,11 @@ use git_ai::daemon::{
     open_local_socket_stream_with_timeout, read_daemon_pid, send_control_request,
 };
 #[cfg(not(windows))]
-use git_ai::git::repository::find_repository_in_path;
-use git_ai::metrics::db::MetricsDatabase;
-use git_ai::metrics::{
-    EventAttributes, MetricEvent, PosEncoded, SessionEventValues, TokenUsageValues,
-};
-use repos::test_file::ExpectedLineExt;
-#[cfg(not(windows))]
 use repos::test_repo::live_pid_trace_sid;
 use repos::test_repo::{
     DAEMON_SPAWN_LOADER_RETRY_ATTEMPTS, DaemonTestCompletionLogEntry, DaemonTestScope, TestRepo,
-    configure_raw_traced_git_env_for, get_binary_path, is_windows_loader_init_failure,
-    real_git_executable, trace_atexit_frame, write_trace_frames,
+    get_binary_path, is_windows_loader_init_failure, real_git_executable, trace_atexit_frame,
+    write_trace_frames,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -45,6 +33,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
+
+macro_rules! native_checkpoint_args {
+    ($path:expr) => { ["checkpoint", "agent-v1", "--hook-input", &serde_json::json!({
+        "type":"ai_agent", "repo_working_dir":".", "agent_name":"codex",
+        "conversation_id":"daemon-test-session", "edited_filepaths":[$path]
+    }).to_string()] };
+}
+
+fn checkpoint_request(repo: &TestRepo, request_id: String, session_id: String) -> LinkCheckpoint {
+    LinkCheckpoint {
+        request_id,
+        repo_working_dir: repo.canonical_path(),
+        session: SessionIdentity::new("codex", &session_id).unwrap(),
+        generation: 0,
+        signal: CheckpointSignal::PostWrite,
+    }
+}
+
+fn persisted_checkpoint_count(database_repo: &TestRepo, scope: &TestRepo) -> usize {
+    let family = git_ai::git::repo_state::common_dir_for_worktree(scope.path())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let connection =
+        git_ai::sqlite::open_with_memory_limits(database_repo.link_store_path_for_test()).unwrap();
+    connection.query_row("SELECT count(*) FROM link_operations WHERE family=?1 AND operation_id LIKE 'checkpoint:%'", [family.to_string_lossy().as_ref()], |row| row.get(0)).unwrap_or(0)
+}
+
+fn has_commit_links(repo: &TestRepo, sha: &str) -> bool {
+    let family = git_ai::git::repo_state::common_dir_for_worktree(repo.path())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let store = LinkStore::open_at(&repo.link_store_path_for_test()).unwrap();
+    !store
+        .sessions_for_commit(&family.to_string_lossy(), sha)
+        .unwrap()
+        .is_empty()
+}
 
 const DAEMON_TEST_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -167,33 +194,6 @@ fn wait_for_test_side_effect_delay_started(repo: &TestRepo) {
 
 fn repo_workdir_string(repo: &TestRepo) -> String {
     repo.path().to_string_lossy().to_string()
-}
-
-struct ScopedEnvVar {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(previous) = self.previous.as_ref() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
 }
 
 struct MockApiServer {
@@ -695,33 +695,10 @@ impl WorkdirRaceHarness {
         }
     }
 
-    fn run_traced_git(&self, workdir: &Path, args: &[&str]) {
-        let mut command = Command::new(real_git_executable());
-        command.args(args).current_dir(workdir);
-        configure_raw_traced_git_env_for(
-            &mut command,
-            &self.test_home,
-            &DaemonConfig::trace2_event_target_for_path(&self.trace_socket_path),
-        );
-        let output = command
-            .env("GIT_AI_TEST_DB_PATH", &self.test_db_path)
-            .env("GITAI_TEST_DB_PATH", &self.test_db_path)
-            .output()
-            .expect("failed to execute traced git command");
-        assert!(
-            output.status.success(),
-            "traced git command failed in {}: git {} \nstdout:{}\nstderr:{}",
-            workdir.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn run_delegated_checkpoint(&self, workdir: &Path, file_rel: &str) {
+    fn run_delegated_checkpoint(&self, workdir: &Path, file_rel: &str) -> u64 {
         let mut command = Command::new(get_binary_path());
         command
-            .args(["checkpoint", "mock_ai", file_rel])
+            .args(native_checkpoint_args!(file_rel))
             .current_dir(workdir);
         configure_test_home_env(&mut command, &self.test_home);
         configure_test_daemon_env(
@@ -744,198 +721,14 @@ impl WorkdirRaceHarness {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        repos::test_repo::parse_checkpoint_request_count(&String::from_utf8_lossy(&output.stdout))
     }
-
-    fn write_ai_line_checkpoint_and_add(&self, workdir: &Path, file_rel: &str, line: &str) {
-        fs::write(workdir.join(file_rel), format!("{line}\n"))
-            .expect("failed writing ai line test file");
-        self.run_delegated_checkpoint(workdir, file_rel);
-        self.run_traced_git(workdir, &["add", file_rel]);
-    }
-}
-
-fn unique_worktree_path(repo: &TestRepo, prefix: &str) -> PathBuf {
-    repo.path().parent().unwrap_or(repo.path()).join(format!(
-        "{}-{}",
-        prefix,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ))
-}
-
-fn parse_blame_line(line: &str) -> (String, String) {
-    if let Some(start_paren) = line.find('(')
-        && let Some(end_paren) = line.find(')')
-    {
-        let author_section = &line[start_paren + 1..end_paren];
-        let content = line[end_paren + 1..].trim().to_string();
-
-        let parts: Vec<&str> = author_section.split_whitespace().collect();
-        let mut author_parts = Vec::new();
-        for part in parts {
-            if part.chars().next().unwrap_or('a').is_ascii_digit() {
-                break;
-            }
-            author_parts.push(part);
-        }
-        return (author_parts.join(" "), content);
-    }
-    ("unknown".to_string(), line.trim().to_string())
-}
-
-fn is_ai_author(author: &str) -> bool {
-    let author_lower = author.to_lowercase();
-    author_lower.contains("mock_ai")
-        || author_lower.contains("claude")
-        || author_lower.contains("cursor")
-        || author_lower.contains("codex")
-}
-
-fn assert_blame_lines_for_workdir(
-    repo: &TestRepo,
-    workdir: &Path,
-    file_rel: &str,
-    expected: &[(String, bool)],
-) {
-    let blame_output = repo
-        .git_ai_from_working_dir(workdir, &["blame", file_rel])
-        .unwrap_or_else(|e| {
-            panic!(
-                "git-ai blame failed in {} for {}: {}",
-                workdir.display(),
-                file_rel,
-                e
-            )
-        });
-    let actual: Vec<(String, String)> = blame_output
-        .lines()
-        .filter(|line: &&str| !line.trim().is_empty())
-        .map(parse_blame_line)
-        .collect();
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "line count mismatch for {} in {}\nblame:\n{}",
-        file_rel,
-        workdir.display(),
-        blame_output
-    );
-
-    for (idx, ((author, content), (expected_content, expected_ai))) in
-        actual.iter().zip(expected.iter()).enumerate()
-    {
-        assert_eq!(
-            content,
-            expected_content,
-            "line {} content mismatch for {} in {}",
-            idx + 1,
-            file_rel,
-            workdir.display()
-        );
-        let actual_ai = is_ai_author(author);
-        assert_eq!(
-            actual_ai,
-            *expected_ai,
-            "line {} attribution mismatch for {} in {} (author='{}', line='{}')",
-            idx + 1,
-            file_rel,
-            workdir.display(),
-            author,
-            content
-        );
-    }
-}
-
-fn assert_single_ai_line_for_workdir(repo: &TestRepo, workdir: &Path, file_rel: &str, line: &str) {
-    assert_blame_lines_for_workdir(repo, workdir, file_rel, &[(line.to_string(), true)]);
 }
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-fn claude_fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("example-claude-code.jsonl")
-}
-
-fn assert_post_commit_uploads_prompt_cas() {
-    let mock_api = MockApiServer::start();
-    let _api_base_url = ScopedEnvVar::set("GIT_AI_API_BASE_URL", mock_api.base_url());
-    let _api_key = ScopedEnvVar::set("GIT_AI_API_KEY", "test-api-key");
-
-    // These tests depend on per-test API env vars being visible to the daemon.
-    // A shared daemon may already be running from an earlier test with different env.
-    let mut repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
-    repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
-        patch.telemetry_oss_disabled = Some(true);
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::GitNotes,
-            backend_url: None,
-        });
-    });
-    repo.restart_dedicated_daemon_with_env_for_test(&[("GIT_AI_NOTES_BACKEND_KIND", "git_notes")]);
-
-    let repo_root = repo.canonical_path();
-    let file_path = repo_root.join("test.ts");
-    fs::write(&file_path, "const x = 1;\n").expect("failed to write initial file");
-    repo.stage_all_and_commit("Initial commit")
-        .expect("initial commit should succeed");
-
-    let transcript_path = repo_root.join("claude-session.jsonl");
-    fs::copy(claude_fixture_path(), &transcript_path).expect("failed to copy transcript fixture");
-
-    let hook_input = json!({
-        "cwd": repo_root.to_string_lossy().to_string(),
-        "hook_event_name": "PostToolUse",
-        "transcript_path": transcript_path.to_string_lossy().to_string(),
-        "tool_input": {
-            "file_path": file_path.to_string_lossy().to_string()
-        }
-    })
-    .to_string();
-
-    fs::write(&file_path, "const x = 1;\n// ai line one\n").expect("failed to write AI edit");
-    repo.git_ai(&["checkpoint", "claude", "--hook-input", &hook_input])
-        .expect("checkpoint should succeed");
-
-    let commit = repo
-        .stage_all_and_commit("Add AI line")
-        .expect("AI commit should succeed");
-
-    // Sessions no longer upload messages to CAS - only prompts do.
-    // Since claude checkpoints create sessions, not prompts, we don't expect a CAS upload.
-    // Verify that the authorship note is created with a session record.
-    let note = repo
-        .read_authorship_note(&commit.commit_sha)
-        .expect("commit should have authorship note");
-    let log =
-        git_ai::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(
-            &note,
-        )
-        .expect("authorship note should deserialize");
-    // AI checkpoints now produce sessions (not prompts)
-    let _session = log
-        .metadata
-        .sessions
-        .values()
-        .next()
-        .expect("authorship note should contain one session");
-    // Sessions no longer have messages or messages_url fields
-}
-
-#[test]
-#[serial]
-fn daemon_mode_post_commit_uploads_prompt_cas() {
-    assert_post_commit_uploads_prompt_cas();
 }
 
 #[test]
@@ -1086,7 +879,7 @@ fn checkpoint_delegate_autostarts_daemon_when_unavailable() {
 
     let completion_baseline = repo.daemon_total_completion_count();
     repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", "delegate-fallback.txt"],
+        &native_checkpoint_args!("delegate-fallback.txt"),
         &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
     )
     .expect("checkpoint should delegate to daemon and succeed");
@@ -1110,15 +903,9 @@ fn checkpoint_delegate_autostarts_daemon_when_unavailable() {
         daemon_control_socket_path(&repo).display(),
         repo_workdir_string(&repo)
     );
-    let checkpoints = repo
-        .current_working_logs()
-        .read_all_checkpoints()
-        .expect("checkpoints should be readable");
     assert!(
-        checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.kind == CheckpointKind::AiAgent),
-        "delegated checkpoint should write ai_agent checkpoint via daemon"
+        persisted_checkpoint_count(&repo, &repo) > 0,
+        "delegated write should persist through the daemon"
     );
 
     let _ = send_control_request(
@@ -1160,7 +947,7 @@ fn checkpoint_fails_hard_when_daemon_startup_is_blocked() {
     let held_lock = DaemonLock::acquire(&daemon_lock_path(&repo))
         .expect("should acquire daemon lock before checkpoint invocation");
 
-    let result = repo.git_ai(&["checkpoint", "mock_ai", "delegate-fallback-blocked.txt"]);
+    let result = repo.git_ai(&native_checkpoint_args!("delegate-fallback-blocked.txt"));
     assert!(
         result.is_ok(),
         "checkpoint should exit(0) when daemon is unavailable (never block agents)"
@@ -1254,22 +1041,16 @@ fn daemon_write_mode_applies_delegated_checkpoint_and_updates_state() {
     .expect("failed to write updated file");
 
     repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", "delegate-write.txt"],
+        &native_checkpoint_args!("delegate-write.txt"),
         &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
     )
     .expect("delegated checkpoint should succeed");
 
     wait_for_expected_top_level_completions(&repo, completion_baseline, 1);
 
-    let checkpoints = repo
-        .current_working_logs()
-        .read_all_checkpoints()
-        .expect("checkpoints should be readable");
     assert!(
-        checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.kind == CheckpointKind::AiAgent),
-        "write-mode daemon should execute checkpoint side effect"
+        persisted_checkpoint_count(&repo, &repo) > 0,
+        "delegated write should persist through the daemon"
     );
 }
 
@@ -1292,65 +1073,14 @@ fn daemon_test_mode_git_ai_checkpoint_runs_via_daemon() {
     .expect("failed to write updated file");
     let completion_baseline = repo.daemon_total_completion_count();
 
-    repo.git_ai(&["checkpoint", "mock_ai", "daemon-mode-checkpoint.txt"])
+    repo.git_ai(&native_checkpoint_args!("daemon-mode-checkpoint.txt"))
         .expect("daemon-mode checkpoint should succeed");
 
     repo.wait_for_next_daemon_checkpoint_completion(completion_baseline);
 
-    let checkpoints = repo
-        .current_working_logs()
-        .read_all_checkpoints()
-        .expect("checkpoints should be readable");
     assert!(
-        checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.kind == CheckpointKind::AiAgent),
-        "daemon-mode checkpoint should still write the ai_agent checkpoint side effect"
-    );
-}
-
-#[test]
-#[serial]
-fn daemon_test_mode_human_checkpoint_with_explicit_preset_queues_via_daemon() {
-    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
-
-    fs::write(repo.path().join("human-direct-path.txt"), "base\n").expect("failed to write base");
-    repo.git_og(&["add", "human-direct-path.txt"])
-        .expect("add should succeed");
-    repo.git_og(&["commit", "-m", "base commit"])
-        .expect("base commit should succeed");
-
-    fs::write(repo.path().join("human-direct-path.txt"), "base\nhuman\n")
-        .expect("failed to write human change");
-    let completion_baseline = repo.daemon_total_completion_count();
-
-    repo.git_ai(&["checkpoint", "human", "human-direct-path.txt"])
-        .expect("human checkpoint with preset should succeed");
-
-    repo.wait_for_next_daemon_checkpoint_completion(completion_baseline);
-
-    let git_ai_repo = git_ai::git::repository::find_repository_in_path(
-        repo.path()
-            .to_str()
-            .expect("repo path should be valid UTF-8"),
-    )
-    .expect("repository should still be discoverable");
-    let base_commit = git_ai_repo
-        .head()
-        .ok()
-        .and_then(|head| head.target().ok())
-        .unwrap_or_else(|| "initial".to_string());
-    let checkpoints = git_ai_repo
-        .storage
-        .working_log_for_base_commit(&base_commit)
-        .unwrap()
-        .read_all_checkpoints()
-        .expect("checkpoints should be readable");
-    assert!(
-        checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.kind == CheckpointKind::Human),
-        "human checkpoint should write the human checkpoint side effect"
+        persisted_checkpoint_count(&repo, &repo) > 0,
+        "delegated write should persist through the daemon"
     );
 }
 
@@ -1399,38 +1129,39 @@ fn daemon_symlink_repo_path_trace_and_status_use_same_family() {
     let checkpoint_baseline = repo.daemon_total_completion_count();
     fs::write(repo.path().join("alias.txt"), "alias\nhuman\n")
         .expect("failed writing human aliased file");
-    repo.git_ai(&["checkpoint", "human"])
+    repo.git_ai(&native_checkpoint_args!("alias.txt"))
         .expect("aliased path human checkpoint should succeed");
     repo.wait_for_next_daemon_checkpoint_completion(checkpoint_baseline);
 
-    let watermark_for = |path: &Path| {
+    let attachment_for = |path: &Path| {
         let response = send_control_request(
             &daemon_control_socket_path(&repo),
-            &ControlRequest::SnapshotWatermarks {
+            &ControlRequest::CheckpointAttachment {
+                session: SessionIdentity::new("codex", "daemon-test-session").unwrap(),
                 repo_working_dir: path.to_string_lossy().to_string(),
             },
         )
-        .expect("daemon watermark request should succeed");
+        .expect("daemon attachment request should succeed");
         assert!(
             response.ok,
-            "daemon watermark response should be ok for {}: {:?}",
+            "daemon attachment response should be ok for {}: {:?}",
             path.display(),
             response.error
         );
         response
             .data
             .as_ref()
-            .and_then(|data| data.get("worktree_watermark"))
-            .and_then(serde_json::Value::as_u64)
+            .and_then(|data| data.get("attached"))
+            .and_then(serde_json::Value::as_bool)
     };
 
     assert!(
-        watermark_for(repo.path()).is_some(),
-        "aliased worktree path should see full-checkpoint watermark"
+        attachment_for(repo.path()) == Some(true),
+        "aliased worktree path should see attached session"
     );
     assert!(
-        watermark_for(&repo.canonical_path()).is_some(),
-        "canonical worktree path should see same full-checkpoint watermark"
+        attachment_for(&repo.canonical_path()) == Some(true),
+        "canonical worktree path should see same attached session"
     );
 
     let _ = fs::remove_file(&alias_path);
@@ -1467,7 +1198,7 @@ fn daemon_pure_trace_socket_commit_after_ai_checkpoint_preserves_ai_replacement_
     fs::write(&file_path, "new line from ai\n").expect("failed to write ai contents");
     expected_top_level_completions += 1;
     repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", "daemon-ai-replace.txt"],
+        &native_checkpoint_args!("daemon-ai-replace.txt"),
         &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
     )
     .expect("ai checkpoint should succeed");
@@ -1493,44 +1224,37 @@ fn daemon_pure_trace_socket_commit_after_ai_checkpoint_preserves_ai_replacement_
     );
 
     let mut file = repo.filename("daemon-ai-replace.txt");
-    file.assert_lines_and_blame(lines!["new line from ai".ai()]);
+    file.assert_committed_lines(lines!["new line from ai"]);
 }
 
 #[test]
 fn daemon_trace_current_dir_commands_reserve_order_from_def_repo() {
     let repo = TestRepo::new_dedicated_daemon();
     let trace_socket = daemon_trace_socket_path(&repo);
+    let untraced_git = |args: &[&str]| repo.git_og_with_env(args, &[("GIT_TRACE2_EVENT", "0")]);
     let worktree = repo_workdir_string(&repo);
     let git_dir = repo.path().join(".git").to_string_lossy().to_string();
 
     fs::write(repo.path().join("base.txt"), "base\n").expect("failed to write base");
-    repo.git_og(&["add", "base.txt"])
-        .expect("base add should succeed");
-    repo.git_og(&["commit", "-m", "base"])
-        .expect("base commit should succeed");
+    untraced_git(&["add", "base.txt"]).expect("base add should succeed");
+    untraced_git(&["commit", "-m", "base"]).expect("base commit should succeed");
 
     fs::write(repo.path().join("a.txt"), "a ai\n").expect("failed to write a.txt");
-    repo.git_ai(&["checkpoint", "mock_ai", "a.txt"])
+    repo.git_ai(&native_checkpoint_args!("a.txt"))
         .expect("a checkpoint should succeed");
-    repo.git_og(&["add", "a.txt"])
-        .expect("a add should succeed");
-    repo.git_og(&["commit", "-m", "commit A"])
-        .expect("commit A should succeed");
-    let commit_a = repo
-        .git_og(&["rev-parse", "HEAD"])
+    untraced_git(&["add", "a.txt"]).expect("a add should succeed");
+    untraced_git(&["commit", "-m", "commit A"]).expect("commit A should succeed");
+    let commit_a = untraced_git(&["rev-parse", "HEAD"])
         .expect("rev-parse A should succeed")
         .trim()
         .to_string();
 
     fs::write(repo.path().join("b.txt"), "b ai\n").expect("failed to write b.txt");
-    repo.git_ai(&["checkpoint", "mock_ai", "b.txt"])
+    repo.git_ai(&native_checkpoint_args!("b.txt"))
         .expect("b checkpoint should succeed");
-    repo.git_og(&["add", "b.txt"])
-        .expect("b add should succeed");
-    repo.git_og(&["commit", "-m", "commit B"])
-        .expect("commit B should succeed");
-    let commit_b = repo
-        .git_og(&["rev-parse", "HEAD"])
+    untraced_git(&["add", "b.txt"]).expect("b add should succeed");
+    untraced_git(&["commit", "-m", "commit B"]).expect("commit B should succeed");
+    let commit_b = untraced_git(&["rev-parse", "HEAD"])
         .expect("rev-parse B should succeed")
         .trim()
         .to_string();
@@ -1585,20 +1309,30 @@ fn daemon_trace_current_dir_commands_reserve_order_from_def_repo() {
             trace_atexit_frame("current-dir-a", 0, 1_101u64),
         ],
     );
-    repo.sync_daemon_external_completion_sessions(&[session_a, session_b]);
+    repo.sync_daemon_external_completion_sessions(&[session_a.clone(), session_b.clone()]);
 
+    let commands = completion_entries_for_command(&repo, "commit");
+    let a = commands
+        .iter()
+        .find(|entry| entry.test_sync_session.as_deref() == Some(session_a.as_str()))
+        .expect("first command completion");
+    let b = commands
+        .iter()
+        .find(|entry| entry.test_sync_session.as_deref() == Some(session_b.as_str()))
+        .expect("second command completion");
     assert!(
-        repo.read_authorship_note(&commit_a).is_some(),
-        "commit A should retain a note even when its trace exit is delivered after commit B"
+        a.seq < b.seq,
+        "def_repo admission must reserve order even when exits arrive in reverse"
     );
-    assert!(
-        repo.read_authorship_note(&commit_b).is_some(),
-        "commit B should have a note"
-    );
+    // Both writes entered the same pending window before either commit was
+    // sequenced. The cursor resolves A first even though B's exit arrived first,
+    // so A consumes the one session and B cannot borrow it from the current HEAD.
+    repo.assert_commit_links(&commit_a, &[("codex", "daemon-test-session")]);
+    repo.assert_commit_links(&commit_b, &[]);
     let mut file_a = repo.filename("a.txt");
-    file_a.assert_committed_lines(lines!["a ai".ai()]);
+    file_a.assert_committed_lines(lines!["a ai"]);
     let mut file_b = repo.filename("b.txt");
-    file_b.assert_committed_lines(lines!["b ai".ai()]);
+    file_b.assert_committed_lines(lines!["b ai"]);
 }
 
 #[test]
@@ -1674,20 +1408,11 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_checkpoint_contro
     let file_path = repo.path().join("checkpoint-after-stalled-trace.txt");
     fs::write(&file_path, "checkpoint content\n").unwrap();
 
-    let request = CheckpointRequest {
-        trace_id: "checkpoint-after-stalled-trace".to_string(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: None,
-        files: vec![CheckpointFile {
-            path: PathBuf::from("checkpoint-after-stalled-trace.txt"),
-            content: Some("checkpoint content\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let request = checkpoint_request(
+        &repo,
+        "checkpoint-after-stalled-trace".to_string(),
+        "daemon-test-session".to_string(),
+    );
 
     let response =
         send_checkpoint_request_with_timeout(&control_socket, &request, Duration::from_millis(500))
@@ -1698,67 +1423,6 @@ fn daemon_stalled_unidentified_trace_connection_does_not_block_checkpoint_contro
         "checkpoint control request should succeed: {:?}",
         response
     );
-}
-
-#[test]
-#[cfg(not(windows))]
-fn daemon_checkpoint_resolution_applies_total_content_budget() {
-    let mut repo = TestRepo::new_dedicated_daemon();
-    repo.patch_git_ai_config(|p| {
-        p.max_checkpoint_file_size_bytes = Some(1024);
-        p.max_checkpoint_total_size_bytes = Some(96);
-        p.max_checkpoint_total_lines = Some(1000);
-    });
-
-    let control_socket = daemon_control_socket_path(&repo);
-    fs::write(repo.path().join("a_kept.txt"), "a".repeat(48)).unwrap();
-    fs::write(repo.path().join("z_skipped.txt"), "z".repeat(64)).unwrap();
-
-    let request = CheckpointRequest {
-        trace_id: "daemon-checkpoint-budget".to_string(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: None,
-        files: vec![
-            CheckpointFile {
-                path: PathBuf::from("a_kept.txt"),
-                content: Some("a".repeat(48)),
-                repo_work_dir: repo.path().to_path_buf(),
-                base_commit: BaseCommit::Initial,
-            },
-            CheckpointFile {
-                path: PathBuf::from("z_skipped.txt"),
-                content: Some("z".repeat(64)),
-                repo_work_dir: repo.path().to_path_buf(),
-                base_commit: BaseCommit::Initial,
-            },
-        ],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
-
-    let response =
-        send_checkpoint_request_with_timeout(&control_socket, &request, Duration::from_secs(5))
-            .expect("checkpoint control request should succeed");
-
-    assert!(
-        response.ok,
-        "checkpoint control request should succeed: {:?}",
-        response
-    );
-
-    let checkpoints = repo
-        .current_working_logs()
-        .read_all_checkpoints()
-        .expect("checkpoints should be readable");
-    assert_eq!(checkpoints.len(), 1, "expected exactly one checkpoint");
-    let checkpoint = checkpoints.last().unwrap();
-    assert_eq!(
-        checkpoint.entries.len(),
-        1,
-        "expected daemon resolver to apply aggregate content budget"
-    );
-    assert_eq!(checkpoint.entries[0].file, "a_kept.txt");
 }
 
 #[test]
@@ -1826,39 +1490,6 @@ fn daemon_checkpoint_receipt_logs_body_receive_errors() {
 }
 
 #[test]
-#[cfg(not(windows))]
-fn wltrace_captures_daemon_working_log_ops_when_enabled() {
-    let trace_file = tempfile::NamedTempFile::new().expect("wltrace temp file");
-    let trace_path = trace_file.path().to_string_lossy().to_string();
-    let repo = TestRepo::new_with_daemon_env(&[("GIT_AI_WLTRACE", trace_path.as_str())]);
-
-    let file_path = repo.path().join("traced.txt");
-    fs::write(&file_path, "AI content\n").unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "traced.txt"])
-        .unwrap();
-    repo.sync_daemon();
-
-    let trace = fs::read_to_string(trace_file.path()).expect("read wltrace output");
-    for op in [
-        "op=checkpoint.admission",
-        "op=drain.exec",
-        "op=working_log.append_checkpoint",
-        "op=working_log.write_all_checkpoints.begin",
-        "op=working_log.write_all_checkpoints.end",
-    ] {
-        assert!(trace.contains(op), "wltrace output missing {op}:\n{trace}");
-    }
-    assert_eq!(
-        trace
-            .lines()
-            .filter(|line| line.contains("op=working_log.read_checkpoints "))
-            .count(),
-        1,
-        "one checkpoint must deserialize the working log only once:\n{trace}"
-    );
-}
-
-#[test]
 fn daemon_checkpoint_ack_preserves_order_with_immediate_commit() {
     let repo = TestRepo::new_with_daemon_env(&[(
         "GIT_AI_TEST_DELAY_CHECKPOINT_SIDE_EFFECT",
@@ -1866,24 +1497,11 @@ fn daemon_checkpoint_ack_preserves_order_with_immediate_commit() {
     )]);
     let file_path = repo.path().join("slow-checkpoint.txt");
     fs::write(&file_path, "AI content\n").unwrap();
-    let request = CheckpointRequest {
-        trace_id: "slow-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "slow-checkpoint-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("slow-checkpoint.txt"),
-            content: Some("AI content\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let request = checkpoint_request(
+        &repo,
+        "slow-checkpoint".to_string(),
+        "slow-checkpoint-session".to_string(),
+    );
 
     let started = std::time::Instant::now();
     let response = send_checkpoint_request_with_timeout(
@@ -1915,24 +1533,10 @@ fn daemon_checkpoint_ack_preserves_order_with_immediate_commit() {
     .unwrap();
 
     let mut file = repo.filename("slow-checkpoint.txt");
-    file.assert_committed_lines(lines!["AI content".ai()]);
+    file.assert_committed_lines(lines!["AI content"]);
 
     let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    let note = repo
-        .read_authorship_note(head.trim())
-        .expect("immediate commit should have an authorship note");
-    let log =
-        git_ai::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(
-            &note,
-        )
-        .expect("authorship note should deserialize");
-    assert!(
-        log.metadata
-            .sessions
-            .values()
-            .any(|session| session.agent_id.id == "slow-checkpoint-session"),
-        "immediate commit should retain checkpoint session metadata"
-    );
+    repo.assert_commit_links(head.trim(), &[("codex", "slow-checkpoint-session")]);
 }
 
 #[test]
@@ -1943,23 +1547,12 @@ fn daemon_soft_shutdown_drains_acknowledged_checkpoints() {
         "shutdown-first=1000",
     )]);
     let control_socket = daemon_control_socket_path(&repo);
-    let request = |trace_id: &str, path: &str, content: &str| CheckpointRequest {
-        trace_id: trace_id.to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "shutdown-drain-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from(path),
-            content: Some(content.to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
+    let request = |trace_id: &str, _path: &str, _content: &str| {
+        checkpoint_request(
+            &repo,
+            trace_id.to_string(),
+            "shutdown-drain-session".to_string(),
+        )
     };
 
     fs::write(repo.path().join("first.txt"), "first\n").unwrap();
@@ -1971,9 +1564,9 @@ fn daemon_soft_shutdown_drains_acknowledged_checkpoints() {
     .expect("first checkpoint should be acknowledged");
     assert!(first.ok, "first checkpoint failed: {first:?}");
 
-    let logs = wait_for_daemon_log(&repo, "checkpoint start");
+    let logs = wait_for_daemon_log(&repo, "checkpoint prepared for family admission");
     assert!(
-        logs.contains("checkpoint start"),
+        logs.contains("checkpoint prepared for family admission"),
         "first checkpoint never started processing:\n{logs}"
     );
 
@@ -2022,15 +1615,8 @@ fn daemon_soft_shutdown_drains_acknowledged_checkpoints() {
         .expect("soft shutdown should wait for acknowledged checkpoints");
     assert!(shutdown.ok, "soft shutdown failed: {shutdown:?}");
 
-    let repository = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
-    let checkpoints = repository
-        .storage
-        .working_log_for_base_commit("initial")
-        .unwrap()
-        .read_all_checkpoints()
-        .unwrap();
     assert_eq!(
-        checkpoints.len(),
+        persisted_checkpoint_count(&repo, &repo),
         2,
         "soft shutdown must not discard successfully acknowledged checkpoints"
     );
@@ -2053,23 +1639,8 @@ fn daemon_drains_independent_checkpoint_families_concurrently() {
     ]);
     let second_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
     let control_socket = daemon_control_socket_path(&first_repo);
-    let request = |repo: &TestRepo, trace_id: &str, path: &str| CheckpointRequest {
-        trace_id: trace_id.to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: trace_id.to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from(path),
-            content: Some(format!("{trace_id}\n")),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
+    let request = |repo: &TestRepo, trace_id: &str, _path: &str| {
+        checkpoint_request(repo, trace_id.to_string(), trace_id.to_string())
     };
 
     fs::write(
@@ -2098,16 +1669,7 @@ fn daemon_drains_independent_checkpoint_families_concurrently() {
 
     let started = std::time::Instant::now();
     loop {
-        let checkpoint_count = |repo: &TestRepo| {
-            find_repository_in_path(repo.path().to_str().unwrap())
-                .unwrap()
-                .storage
-                .working_log_for_base_commit("initial")
-                .unwrap()
-                .read_all_checkpoints()
-                .map(|checkpoints| checkpoints.len())
-                .unwrap_or(0)
-        };
+        let checkpoint_count = |repo: &TestRepo| persisted_checkpoint_count(&first_repo, repo);
         if checkpoint_count(&first_repo) == 1 && checkpoint_count(&second_repo) == 1 {
             break;
         }
@@ -2150,24 +1712,11 @@ fn family_side_effect_grind_does_not_stall_independent_checkpoint_admission() {
         "independent-grind-checkpoint\n",
     )
     .unwrap();
-    let checkpoint = CheckpointRequest {
-        trace_id: "independent-grind-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "independent-grind-checkpoint".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("independent.txt"),
-            content: Some("independent-grind-checkpoint\n".to_string()),
-            repo_work_dir: independent_repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let checkpoint = checkpoint_request(
+        &independent_repo,
+        "independent-grind-checkpoint".to_string(),
+        "independent-grind-checkpoint".to_string(),
+    );
     let response =
         send_checkpoint_request_with_timeout(&control_socket, &checkpoint, Duration::from_secs(2))
             .expect("checkpoint should be acknowledged during an unrelated side-effect grind");
@@ -2177,14 +1726,7 @@ fn family_side_effect_grind_does_not_stall_independent_checkpoint_admission() {
     // completes; admission queueing behind the grind is issue #2252.
     let started = std::time::Instant::now();
     loop {
-        let checkpoint_count = find_repository_in_path(independent_repo.path().to_str().unwrap())
-            .unwrap()
-            .storage
-            .working_log_for_base_commit("initial")
-            .unwrap()
-            .read_all_checkpoints()
-            .map(|checkpoints| checkpoints.len())
-            .unwrap_or(0);
+        let checkpoint_count = persisted_checkpoint_count(&grinding_repo, &independent_repo);
         if checkpoint_count == 1 {
             break;
         }
@@ -2219,24 +1761,11 @@ fn checkpoint_admission_proceeds_while_same_family_side_effects_grind() {
     wait_for_test_side_effect_delay_started(&repo);
 
     fs::write(repo.path().join("same-family.txt"), "same-family\n").unwrap();
-    let checkpoint = CheckpointRequest {
-        trace_id: "same-family-grind-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "same-family-grind-checkpoint".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("same-family.txt"),
-            content: Some("same-family\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let checkpoint = checkpoint_request(
+        &repo,
+        "same-family-grind-checkpoint".to_string(),
+        "same-family-grind-checkpoint".to_string(),
+    );
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
         &checkpoint,
@@ -2359,68 +1888,6 @@ fn graceful_shutdown_waits_for_detached_side_effect_passes() {
     );
 }
 
-/// #2252: a side-effect pass can write into a DIFFERENT repository — e.g.
-/// `git push <path>` pushes authorship notes into the destination repo.
-/// Before side effects ran detached, the global ingest watermark implied
-/// they had completed, so `sync.family` on the destination covered them
-/// transitively. That guarantee must survive detachment: sync.family must
-/// not report until already-ingested side-effect work has finished, in any
-/// family.
-#[test]
-#[cfg(not(windows))]
-fn sync_family_covers_cross_repo_side_effects_of_other_families() {
-    let local = TestRepo::new_with_daemon_env(&[(
-        "GIT_AI_TEST_DELAY_SIDE_EFFECT_MS_FOR_COMMAND",
-        "push=3000",
-    )]);
-    let destination = TestRepo::new_bare_with_daemon_scope(DaemonTestScope::NoDaemon);
-
-    fs::write(local.path().join("pushed.txt"), "pushed\n").unwrap();
-    local.git_og(&["add", "pushed.txt"]).unwrap();
-    local.git_og(&["commit", "-m", "pushed commit"]).unwrap();
-    let commit_sha = local
-        .git_og(&["rev-parse", "HEAD"])
-        .unwrap()
-        .trim()
-        .to_string();
-    local
-        .git_og(&[
-            "notes",
-            "--ref=ai",
-            "add",
-            "-m",
-            "cross-repo-note",
-            commit_sha.as_str(),
-        ])
-        .unwrap();
-
-    let destination_path = destination.path().to_string_lossy().to_string();
-    local
-        .git_without_test_sync_for_test(
-            &["push", destination_path.as_str(), "HEAD:refs/heads/pushed"],
-            &[],
-        )
-        .unwrap();
-    wait_for_test_side_effect_delay_started(&local);
-
-    let sync = send_control_request_with_timeout(
-        &daemon_control_socket_path(&local),
-        &ControlRequest::SyncFamily {
-            repo_working_dir: destination_path.clone(),
-        },
-        Duration::from_secs(30),
-    )
-    .expect("sync.family for the destination should succeed");
-    assert!(sync.ok, "sync.family failed: {sync:?}");
-
-    let pushed_note = destination.git_og(&["notes", "--ref=ai", "show", commit_sha.as_str()]);
-    assert!(
-        pushed_note.is_ok_and(|note| note.contains("cross-repo-note")),
-        "sync.family for the destination returned before the push side-effect \
-         pass finished pushing authorship notes into it (#2252)"
-    );
-}
-
 /// #2252 observability: when checkpoint admission is delayed behind the
 /// trace-ingest watermark, the daemon must log the delay explicitly instead
 /// of it having to be inferred from absent admission log lines.
@@ -2475,24 +1942,11 @@ fn delayed_checkpoint_admission_is_logged() {
     thread::sleep(Duration::from_millis(200));
 
     fs::write(repo.path().join("delayed.txt"), "delayed\n").unwrap();
-    let checkpoint = CheckpointRequest {
-        trace_id: "delayed-admission-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "delayed-admission-checkpoint".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("delayed.txt"),
-            content: Some("delayed\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let checkpoint = checkpoint_request(
+        &repo,
+        "delayed-admission-checkpoint".to_string(),
+        "delayed-admission-checkpoint".to_string(),
+    );
     let response = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
         &checkpoint,
@@ -2525,20 +1979,11 @@ fn daemon_checkpoint_processing_failure_is_logged_after_receipt_ack() {
     )]);
     let file_path = repo.path().join("failing-checkpoint.txt");
     fs::write(&file_path, "content\n").unwrap();
-    let request = CheckpointRequest {
-        trace_id: "failing-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: None,
-        files: vec![CheckpointFile {
-            path: PathBuf::from("failing-checkpoint.txt"),
-            content: Some("content\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let request = checkpoint_request(
+        &repo,
+        "failing-checkpoint".to_string(),
+        "daemon-test-session".to_string(),
+    );
 
     let receipt = send_checkpoint_request_with_timeout(
         &daemon_control_socket_path(&repo),
@@ -2575,127 +2020,6 @@ fn daemon_checkpoint_processing_failure_is_logged_after_receipt_ack() {
             && daemon_logs.contains("synthetic checkpoint processing failure")
             && daemon_logs.contains(&format!("receipt_seq={receipt_seq}")),
         "daemon logs did not contain structured checkpoint failure context:\n{daemon_logs}"
-    );
-}
-
-#[test]
-fn daemon_async_checkpoint_receipts_preserve_file_edit_order_before_commit() {
-    let repo = TestRepo::new_with_daemon_env(&[(
-        "GIT_AI_TEST_DELAY_CHECKPOINT_SIDE_EFFECT",
-        "pre-edit-checkpoint=500",
-    )]);
-    let control_socket = daemon_control_socket_path(&repo);
-    let file_path = repo.path().join("ordered-edit.txt");
-
-    fs::write(
-        &file_path,
-        "committed baseline\nunchanged one\nunchanged two\nunchanged three\n",
-    )
-    .unwrap();
-    repo.stage_all_and_commit("Initial baseline").unwrap();
-    let mut file = repo.filename("ordered-edit.txt");
-    file.assert_committed_lines(lines![
-        "committed baseline".unattributed_human(),
-        "unchanged one".unattributed_human(),
-        "unchanged two".unattributed_human(),
-        "unchanged three".unattributed_human(),
-    ]);
-    let base_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
-
-    fs::write(
-        &file_path,
-        "untracked before AI\nunchanged one\nunchanged two\nunchanged three\n",
-    )
-    .unwrap();
-    let pre_edit = CheckpointRequest {
-        trace_id: "pre-edit-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "ordered-edit-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("ordered-edit.txt"),
-            content: Some(
-                "untracked before AI\nunchanged one\nunchanged two\nunchanged three\n".to_string(),
-            ),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Sha(base_commit.clone()),
-        }],
-        path_role: PreparedPathRole::WillEdit,
-        stream_source: None,
-        metadata: Default::default(),
-    };
-    let pre_receipt = send_checkpoint_request_with_timeout(
-        &control_socket,
-        &pre_edit,
-        Duration::from_millis(500),
-    )
-    .expect("pre-edit receipt");
-    assert!(pre_receipt.ok && pre_receipt.seq.is_some());
-
-    fs::write(
-        &file_path,
-        "untracked before AI\nunchanged one\nunchanged two\nAI addition\n",
-    )
-    .unwrap();
-    let post_edit = CheckpointRequest {
-        trace_id: "post-edit-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "ordered-edit-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("ordered-edit.txt"),
-            content: Some(
-                "untracked before AI\nunchanged one\nunchanged two\nAI addition\n".to_string(),
-            ),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Sha(base_commit),
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
-    let post_receipt = send_checkpoint_request_with_timeout(
-        &control_socket,
-        &post_edit,
-        Duration::from_millis(500),
-    )
-    .expect("post-edit receipt");
-    assert!(post_receipt.ok && post_receipt.seq.is_some());
-    assert!(pre_receipt.seq < post_receipt.seq);
-
-    repo.git_without_test_sync_for_test(&["add", "."], &[])
-        .unwrap();
-    repo.git_without_test_sync_for_test(&["commit", "-m", "Immediate commit after receipts"], &[])
-        .unwrap();
-
-    file.assert_committed_lines(lines![
-        "untracked before AI".unattributed_human(),
-        "unchanged one".unattributed_human(),
-        "unchanged two".unattributed_human(),
-        "AI addition".ai(),
-    ]);
-
-    let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    let note = repo
-        .read_authorship_note(head.trim())
-        .expect("immediate commit should have an authorship note");
-    let log =
-        git_ai::authorship::authorship_log_serialization::AuthorshipLog::deserialize_from_string(
-            &note,
-        )
-        .expect("authorship note should deserialize");
-    assert!(
-        log.metadata
-            .sessions
-            .values()
-            .any(|session| session.agent_id.id == "ordered-edit-session"),
-        "immediate commit should retain ordered checkpoint session metadata"
     );
 }
 
@@ -2741,84 +2065,6 @@ fn daemon_checkpoint_receipt_releases_quota_when_body_sender_stalls() {
     assert!(
         after_timeout.ok,
         "stalled checkpoint reservation should be released after receive timeout: {after_timeout:?}"
-    );
-}
-
-#[test]
-#[cfg(not(windows))]
-fn daemon_checkpoint_initial_base_does_not_fall_back_to_processing_time_head() {
-    let repo = TestRepo::new_dedicated_daemon();
-    let control_socket = daemon_control_socket_path(&repo);
-    let file_path = repo.path().join("captured-before-initial-commit.txt");
-
-    fs::write(&file_path, "existing after capture\n").unwrap();
-    repo.stage_all_and_commit("Create HEAD after checkpoint capture")
-        .unwrap();
-    let mut file = repo.filename("captured-before-initial-commit.txt");
-    file.assert_committed_lines(lines!["existing after capture".unattributed_human(),]);
-    let processing_time_working_log = repo.current_working_logs();
-    fs::remove_dir_all(&processing_time_working_log.dir).unwrap();
-
-    fs::write(
-        &file_path,
-        "existing after capture\nAI edit from captured initial state\n",
-    )
-    .unwrap();
-    let request = CheckpointRequest {
-        trace_id: "checkpoint-captured-with-initial-base".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "captured-initial-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("captured-before-initial-commit.txt"),
-            content: Some(
-                "existing after capture\nAI edit from captured initial state\n".to_string(),
-            ),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
-
-    let response =
-        send_checkpoint_request_with_timeout(&control_socket, &request, Duration::from_secs(5))
-            .expect("checkpoint control request should succeed");
-    assert!(response.ok, "checkpoint failed: {response:?}");
-    let sync = send_control_request_with_timeout(
-        &control_socket,
-        &ControlRequest::SyncFamily {
-            repo_working_dir: repo_workdir_string(&repo),
-        },
-        Duration::from_secs(5),
-    )
-    .expect("sync.family should wait for checkpoint processing");
-    assert!(sync.ok, "sync.family failed: {sync:?}");
-
-    let repository = find_repository_in_path(repo.path().to_str().unwrap()).unwrap();
-    let initial_working_log = repository
-        .storage
-        .working_log_for_base_commit("initial")
-        .unwrap();
-    let checkpoints = initial_working_log.read_all_checkpoints().unwrap();
-    assert_eq!(checkpoints.len(), 1);
-    assert_eq!(
-        checkpoints[0].entries[0].line_attributions,
-        vec![
-            git_ai::authorship::attribution_tracker::LineAttribution::new(
-                1,
-                2,
-                checkpoints[0].entries[0].line_attributions[0]
-                    .author_id
-                    .clone(),
-                None,
-            )
-        ],
-        "an explicitly captured initial base must not diff against processing-time HEAD"
     );
 }
 
@@ -2954,8 +2200,13 @@ fn daemon_status_daemon_reports_open_root_and_fenced_checkpoint() {
     )
     .expect("untraced commit");
     fs::write(repo.path().join("fenced.txt"), "fenced ai\n").unwrap();
-    repo.git_ai_without_pre_sync_for_test(&["checkpoint", "mock_ai", "fenced.txt"])
-        .unwrap();
+    let receipt = send_checkpoint_request_with_timeout(
+        &daemon_control_socket_path(&repo),
+        &checkpoint_request(&repo, "fenced-checkpoint".into(), "fenced-session".into()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(receipt.ok);
 
     let started = std::time::Instant::now();
     let fenced = loop {
@@ -3106,20 +2357,11 @@ fn daemon_partial_trace_line_does_not_block_checkpoint_control_request() {
     let file_path = repo.path().join("checkpoint-after-partial-trace.txt");
     fs::write(&file_path, "checkpoint content\n").unwrap();
 
-    let request = CheckpointRequest {
-        trace_id: "checkpoint-after-partial-trace".to_string(),
-        checkpoint_kind: CheckpointKind::Human,
-        agent_id: None,
-        files: vec![CheckpointFile {
-            path: PathBuf::from("checkpoint-after-partial-trace.txt"),
-            content: Some("checkpoint content\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Initial,
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let request = checkpoint_request(
+        &repo,
+        "checkpoint-after-partial-trace".to_string(),
+        "daemon-test-session".to_string(),
+    );
 
     let response =
         send_checkpoint_request_with_timeout(&control_socket, &request, Duration::from_millis(500))
@@ -3856,7 +3098,7 @@ fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
     let git_dir = repo.path().join(".git").to_string_lossy().to_string();
 
     let mut shared_file = repo.filename("shared.txt");
-    shared_file.set_contents(lines!["line 1".human(), "line 2".human()]);
+    shared_file.set_contents(lines!["line 1", "line 2"]);
     repo.stage_all_and_commit("initial commit")
         .expect("initial commit should succeed");
     let default_branch = repo.current_branch();
@@ -3864,7 +3106,13 @@ fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
     repo.git(&["checkout", "-b", "feature"])
         .expect("checkout feature should succeed");
     let mut feature_file = repo.filename("shared.txt");
-    feature_file.set_contents(lines!["line 1".human(), "AI feature line 2".ai()]);
+    feature_file.set_contents(lines!["line 1", "AI feature line 2"]);
+    feature_file
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            feature_file.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     repo.stage_all_and_commit("AI feature changes")
         .expect("feature commit should succeed");
     let feature_sha = repo
@@ -3873,14 +3121,14 @@ fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
         .trim()
         .to_string();
     assert!(
-        repo.read_authorship_note(&feature_sha).is_some(),
-        "feature commit should have a note before rebase"
+        has_commit_links(&repo, &feature_sha),
+        "feature commit should have a local link before rebase"
     );
 
     repo.git(&["checkout", &default_branch])
         .expect("checkout default branch should succeed");
     let mut main_file = repo.filename("shared.txt");
-    main_file.set_contents(lines!["line 1".human(), "main change line 2".human()]);
+    main_file.set_contents(lines!["line 1", "main change line 2"]);
     repo.stage_all_and_commit("main conflicting change")
         .expect("main commit should succeed");
 
@@ -3966,7 +3214,7 @@ fn daemon_failed_rebase_does_not_consume_later_continue_reflog_entry() {
     repo.sync_daemon_external_completion_sessions(&[rebase_session, continue_session]);
 
     assert!(
-        repo.read_authorship_note(&rebased_sha).is_some(),
+        has_commit_links(&repo, &rebased_sha),
         "rebased commit should get the remapped note even when failed rebase processing is delayed until after --continue"
     );
 }
@@ -3979,7 +3227,7 @@ fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry(
     let git_dir = repo.path().join(".git").to_string_lossy().to_string();
 
     let mut file = repo.filename("picked.txt");
-    file.set_contents(lines!["base".human()]);
+    file.set_contents(lines!["base"]);
     let base_commit = repo
         .stage_all_and_commit("base")
         .expect("base commit should succeed");
@@ -3987,18 +3235,25 @@ fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry(
 
     repo.git(&["checkout", "-b", "source"])
         .expect("checkout source should succeed");
-    file.insert_at(1, lines!["AI picked line".ai()]);
+    file.insert_at(1, lines!["AI picked line"]);
+    file.repo
+        .git_ai(&native_checkpoint_args!(
+            file.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let source_commit = repo
         .stage_all_and_commit("source change")
         .expect("source commit should succeed");
-    repo.read_authorship_note(&source_commit.commit_sha)
-        .expect("source commit should have an authorship note");
+    repo.assert_commit_links(
+        &source_commit.commit_sha,
+        &[("codex", "daemon-test-session")],
+    );
 
     repo.git(&["checkout", &default_branch])
         .expect("checkout default branch should succeed");
 
     let mut main_file = repo.filename("main.txt");
-    main_file.set_contents(lines!["main branch line".human()]);
+    main_file.set_contents(lines!["main branch line"]);
     let main_tip = repo
         .stage_all_and_commit("main branch advance")
         .expect("main branch advance should succeed");
@@ -4015,8 +3270,8 @@ fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry(
         .to_string();
     assert_ne!(stale_commit, base_commit.commit_sha);
     assert!(
-        repo.read_authorship_note(&stale_commit).is_none(),
-        "raw stale commit should not have an authorship note"
+        !has_commit_links(&repo, &stale_commit),
+        "raw stale commit should not have an session link"
     );
 
     repo.git_og(&["reset", "--hard", &main_tip.commit_sha])
@@ -4033,8 +3288,8 @@ fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry(
     assert_ne!(picked_commit, source_commit.commit_sha);
     assert_ne!(picked_commit, stale_commit);
     assert!(
-        repo.read_authorship_note(&picked_commit).is_none(),
-        "raw cherry-pick should not write the note before synthetic trace processing"
+        !has_commit_links(&repo, &picked_commit),
+        "raw cherry-pick should not write the link before synthetic trace processing"
     );
 
     let cherry_pick_session = repos::test_repo::new_daemon_test_sync_session_id();
@@ -4068,11 +3323,11 @@ fn daemon_late_cherry_pick_trace_uses_actual_destination_not_stale_commit_entry(
     repo.sync_daemon_external_completion_sessions(&[cherry_pick_session]);
 
     assert!(
-        repo.read_authorship_note(&stale_commit).is_none(),
+        !has_commit_links(&repo, &stale_commit),
         "stale historical commit must not receive the cherry-pick note"
     );
     let mut file = repo.filename("picked.txt");
-    file.assert_lines_and_blame(lines!["base".ai(), "AI picked line".ai(),]);
+    file.assert_committed_lines(lines!["base", "AI picked line",]);
 }
 
 #[test]
@@ -4083,7 +3338,7 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
     let git_dir = repo.path().join(".git").to_string_lossy().to_string();
 
     let mut file = repo.filename("file.txt");
-    file.set_contents(lines!["line 1".human()]);
+    file.set_contents(lines!["line 1"]);
     repo.stage_all_and_commit("Initial")
         .expect("initial commit should succeed");
 
@@ -4091,24 +3346,34 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
 
     repo.git(&["checkout", "-b", "feature"])
         .expect("checkout feature should succeed");
-    file.replace_at(0, "AI line 1".ai());
+    file.replace_at(0, "AI line 1");
+    file.repo
+        .git_ai(&native_checkpoint_args!(
+            file.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     repo.stage_all_and_commit("AI changes")
         .expect("conflicting AI commit should succeed");
 
     let mut feature_file = repo.filename("feature.txt");
-    feature_file.set_contents(lines!["// AI feature".ai()]);
+    feature_file.set_contents(lines!["// AI feature"]);
+    feature_file
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            feature_file.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let feature_commit = repo
         .stage_all_and_commit("Add feature")
         .expect("feature commit should succeed");
     assert!(
-        repo.read_authorship_note(&feature_commit.commit_sha)
-            .is_some(),
-        "feature commit should have a note before rebase"
+        has_commit_links(&repo, &feature_commit.commit_sha),
+        "feature commit should have a local link before rebase"
     );
 
     repo.git(&["checkout", &default_branch])
         .expect("checkout default branch should succeed");
-    file.replace_at(0, "MAIN line 1".human());
+    file.replace_at(0, "MAIN line 1");
     repo.stage_all_and_commit("Main changes")
         .expect("main commit should succeed");
 
@@ -4186,10 +3451,10 @@ fn daemon_failed_rebase_does_not_consume_later_skip_reflog_entry() {
     repo.sync_daemon_external_completion_sessions(&[rebase_session, skip_session]);
 
     assert!(
-        repo.read_authorship_note(&rebased_feature_sha).is_some(),
+        has_commit_links(&repo, &rebased_feature_sha),
         "rebased feature commit should get the remapped note when failed rebase processing is delayed until after --skip"
     );
-    feature_file.assert_committed_lines(lines!["// AI feature".ai()]);
+    feature_file.assert_committed_lines(lines!["// AI feature"]);
 }
 
 #[test]
@@ -4267,12 +3532,14 @@ fn daemon_pure_trace_socket_checkpoint_stage_checkpoint_two_commits_preserve_ai_
             .expect("failed to open file for first append");
         writeln!(f, "test").expect("failed to append first ai line");
     }
-    repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-    )
-    .expect("first delegated ai checkpoint should succeed");
-    expected_top_level_completions += 1;
+    let checkpoint_output = repo
+        .git_ai_with_env(
+            &native_checkpoint_args!(file_rel),
+            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        )
+        .expect("first delegated ai checkpoint should succeed");
+    expected_top_level_completions +=
+        repos::test_repo::parse_checkpoint_request_count(&checkpoint_output);
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
@@ -4294,12 +3561,14 @@ fn daemon_pure_trace_socket_checkpoint_stage_checkpoint_two_commits_preserve_ai_
             .expect("failed to open file for second append");
         writeln!(f, "test1").expect("failed to append second ai line");
     }
-    repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-    )
-    .expect("second delegated ai checkpoint should succeed");
-    expected_top_level_completions += 1;
+    let checkpoint_output = repo
+        .git_ai_with_env(
+            &native_checkpoint_args!(file_rel),
+            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        )
+        .expect("second delegated ai checkpoint should succeed");
+    expected_top_level_completions +=
+        repos::test_repo::parse_checkpoint_request_count(&checkpoint_output);
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
@@ -4340,7 +3609,7 @@ fn daemon_pure_trace_socket_checkpoint_stage_checkpoint_two_commits_preserve_ai_
     );
 
     let mut file = repo.filename(file_rel);
-    file.assert_lines_and_blame(lines!["base", "test".ai(), "test1".ai()]);
+    file.assert_committed_lines(lines!["base", "test", "test1"]);
 }
 
 #[test]
@@ -4397,12 +3666,14 @@ middle line 2
 omega body
 ";
     fs::write(&file_path, first_ai_hunk).expect("failed to write first hunk content");
-    repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-    )
-    .expect("first delegated checkpoint should succeed");
-    expected_top_level_completions += 1;
+    let checkpoint_output = repo
+        .git_ai_with_env(
+            &native_checkpoint_args!(file_rel),
+            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        )
+        .expect("first delegated checkpoint should succeed");
+    expected_top_level_completions +=
+        repos::test_repo::parse_checkpoint_request_count(&checkpoint_output);
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
@@ -4430,12 +3701,14 @@ middle line 2
 omega body
 ";
     fs::write(&file_path, both_hunks).expect("failed to write both hunks content");
-    repo.git_ai_with_env(
-        &["checkpoint", "mock_ai", file_rel],
-        &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-    )
-    .expect("second delegated checkpoint should succeed");
-    expected_top_level_completions += 1;
+    let checkpoint_output = repo
+        .git_ai_with_env(
+            &native_checkpoint_args!(file_rel),
+            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
+        )
+        .expect("second delegated checkpoint should succeed");
+    expected_top_level_completions +=
+        repos::test_repo::parse_checkpoint_request_count(&checkpoint_output);
     wait_for_expected_top_level_completions(
         &repo,
         completion_baseline,
@@ -4476,16 +3749,16 @@ omega body
     );
 
     let mut file = repo.filename(file_rel);
-    file.assert_lines_and_blame(lines![
+    file.assert_committed_lines(lines![
         "Top line",
-        "".human(),
-        "### Section Alpha".ai(),
+        "",
+        "### Section Alpha",
         "alpha body",
-        "".human(),
+        "",
         "middle line 1",
         "middle line 2",
-        "".human(),
-        "### Section Omega".ai(),
+        "",
+        "### Section Omega",
         "omega body",
     ]);
 }
@@ -5606,11 +4879,11 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
     let git_dir = local.path().join(".git").to_string_lossy().to_string();
 
     let mut readme = local.filename("README.md");
-    readme.set_contents(lines!["# Test Repo".human()]);
+    readme.set_contents(lines!["# Test Repo"]);
     let initial = local
         .stage_all_and_commit("initial commit")
         .expect("initial commit should succeed");
-    readme.assert_committed_lines(lines!["# Test Repo".human()]);
+    readme.assert_committed_lines(lines!["# Test Repo"]);
 
     local
         .git(&["push", "-u", "origin", "HEAD"])
@@ -5618,15 +4891,21 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
 
     let mut committed_ai = local.filename("ai_feature.txt");
     committed_ai.set_contents(lines![
-        "AI generated feature line 1".ai(),
-        "AI generated feature line 2".ai(),
+        "AI generated feature line 1",
+        "AI generated feature line 2",
     ]);
+    committed_ai
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            committed_ai.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let local_ai = local
         .stage_all_and_commit("add AI feature")
         .expect("AI feature commit should succeed");
     committed_ai.assert_committed_lines(lines![
-        "AI generated feature line 1".ai(),
-        "AI generated feature line 2".ai(),
+        "AI generated feature line 1",
+        "AI generated feature line 2",
     ]);
 
     let branch = local.current_branch();
@@ -5635,11 +4914,11 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
         .expect("reset to initial commit should succeed");
 
     let mut upstream_file = local.filename("upstream_change.txt");
-    upstream_file.set_contents(lines!["upstream content".human()]);
+    upstream_file.set_contents(lines!["upstream content"]);
     local
         .stage_all_and_commit("upstream divergent commit")
         .expect("upstream commit should succeed");
-    upstream_file.assert_committed_lines(lines!["upstream content".human()]);
+    upstream_file.assert_committed_lines(lines!["upstream content"]);
 
     local
         .git(&["push", "--force", "origin", &format!("HEAD:{}", branch)])
@@ -5649,9 +4928,15 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
         .expect("reset back to local AI commit should succeed");
 
     let mut uncommitted_ai = local.filename("uncommitted_ai.txt");
-    uncommitted_ai.set_contents(lines!["Uncommitted AI line".ai()]);
+    uncommitted_ai.set_contents(lines!["Uncommitted AI line"]);
+    uncommitted_ai
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            uncommitted_ai.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     local
-        .git_ai(&["checkpoint", "mock_ai", "uncommitted_ai.txt"])
+        .git_ai(&native_checkpoint_args!("uncommitted_ai.txt"))
         .expect("checkpoint should succeed");
     local.sync_daemon();
 
@@ -5723,10 +5008,10 @@ fn daemon_delayed_pull_rebase_autostash_does_not_consume_later_commit() {
     local.sync_daemon_external_completion_sessions(&[pull_session, commit_session]);
 
     assert!(
-        local.read_authorship_note(&final_commit).is_some(),
+        has_commit_links(&local, &final_commit),
         "delayed pull processing must not consume the following commit reflog entry"
     );
-    uncommitted_ai.assert_committed_lines(lines!["Uncommitted AI line".ai()]);
+    uncommitted_ai.assert_committed_lines(lines!["Uncommitted AI line"]);
 }
 
 #[test]
@@ -5760,29 +5045,59 @@ fn daemon_delayed_failed_rebase_continue_does_not_consume_final_continue() {
     repo.git(&["checkout", "-b", "feature", &base_sha]).unwrap();
 
     let mut module_a = repo.filename("module_a.py");
-    module_a.set_contents(lines!["class ModuleA:".ai(), "    pass".ai()]);
+    module_a.set_contents(lines!["class ModuleA:", "    pass"]);
+    module_a
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            module_a.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let original_c1 = repo.stage_all_and_commit("feat: C1 add ModuleA").unwrap();
-    module_a.assert_committed_lines(lines!["class ModuleA:".ai(), "    pass".ai()]);
+    module_a.assert_committed_lines(lines!["class ModuleA:", "    pass"]);
 
     let mut config_a = repo.filename("config_a.py");
-    config_a.set_contents(lines!["FLAG_A = 2".ai()]);
+    config_a.set_contents(lines!["FLAG_A = 2"]);
+    config_a
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            config_a.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let original_c2 = repo.stage_all_and_commit("feat: C2 sets flag_a").unwrap();
-    config_a.assert_committed_lines(lines!["FLAG_A = 2".ai()]);
+    config_a.assert_committed_lines(lines!["FLAG_A = 2"]);
 
     let mut module_c = repo.filename("module_c.py");
-    module_c.set_contents(lines!["class ModuleC:".ai(), "    pass".ai()]);
+    module_c.set_contents(lines!["class ModuleC:", "    pass"]);
+    module_c
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            module_c.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let original_c3 = repo.stage_all_and_commit("feat: C3 add ModuleC").unwrap();
-    module_c.assert_committed_lines(lines!["class ModuleC:".ai(), "    pass".ai()]);
+    module_c.assert_committed_lines(lines!["class ModuleC:", "    pass"]);
 
     let mut config_b = repo.filename("config_b.py");
-    config_b.set_contents(lines!["FLAG_B = 1".ai(), "BATCH = 200".ai()]);
+    config_b.set_contents(lines!["FLAG_B = 1", "BATCH = 200"]);
+    config_b
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            config_b.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let original_c4 = repo.stage_all_and_commit("feat: C4 sets batch").unwrap();
-    config_b.assert_committed_lines(lines!["FLAG_B = 1".ai(), "BATCH = 200".ai()]);
+    config_b.assert_committed_lines(lines!["FLAG_B = 1", "BATCH = 200"]);
 
     let mut module_e = repo.filename("module_e.py");
-    module_e.set_contents(lines!["class ModuleE:".ai(), "    pass".ai()]);
+    module_e.set_contents(lines!["class ModuleE:", "    pass"]);
+    module_e
+        .repo
+        .git_ai(&native_checkpoint_args!(
+            module_e.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     let original_c5 = repo.stage_all_and_commit("feat: C5 add ModuleE").unwrap();
-    module_e.assert_committed_lines(lines!["class ModuleE:".ai(), "    pass".ai()]);
+    module_e.assert_committed_lines(lines!["class ModuleE:", "    pass"]);
     for commit in [
         &original_c1,
         &original_c2,
@@ -5791,8 +5106,8 @@ fn daemon_delayed_failed_rebase_continue_does_not_consume_final_continue() {
         &original_c5,
     ] {
         assert!(
-            repo.read_authorship_note(&commit.commit_sha).is_some(),
-            "original feature commit should have authorship note"
+            has_commit_links(&repo, &commit.commit_sha),
+            "original feature commit should have session link"
         );
     }
     repo.sync_daemon();
@@ -5908,139 +5223,12 @@ fn daemon_delayed_failed_rebase_continue_does_not_consume_final_continue() {
 
     for (idx, sha) in final_chain.iter().enumerate() {
         assert!(
-            repo.read_authorship_note(sha).is_some(),
-            "rebased commit {} should have authorship note after delayed continue processing",
+            has_commit_links(&repo, sha),
+            "rebased commit {} should have session link after delayed continue processing",
             idx + 1
         );
     }
-    module_e.assert_committed_lines(lines!["class ModuleE:".ai(), "    pass".ai()]);
-}
-
-#[test]
-#[serial]
-fn daemon_pure_trace_socket_high_throughput_ai_commit_burst_preserves_exact_blame() {
-    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
-    let _daemon = DaemonGuard::start(&repo);
-    let trace_socket = daemon_trace_socket_path(&repo);
-    let env = git_trace_env(&trace_socket);
-    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
-
-    let file_count = 16usize;
-    let completion_baseline = repo.daemon_total_completion_count();
-    let mut expected_completions = 0u64;
-    for idx in 0..file_count {
-        let file_rel = format!("daemon-race-file-{idx}.txt");
-        let file_path = repo.path().join(file_rel.as_str());
-        fs::write(&file_path, format!("ai-line-{idx}\n"))
-            .expect("failed to write ai burst test file");
-
-        repo.git_ai_with_env(
-            &["checkpoint", "mock_ai", file_rel.as_str()],
-            &[("GIT_AI_DAEMON_CHECKPOINT_DELEGATE", "true")],
-        )
-        .expect("delegated ai checkpoint should succeed");
-        expected_completions += 1;
-
-        repo.git_og_with_env(&["add", file_rel.as_str()], &env_refs)
-            .expect("staging ai burst file should succeed");
-        expected_completions += 1;
-    }
-
-    // Wait for all checkpoints and adds to complete before committing
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    repo.git_og_with_env(&["commit", "-m", "ai burst commit"], &env_refs)
-        .expect("ai burst commit should succeed");
-    expected_completions += 1;
-
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    for idx in 0..file_count {
-        let mut file = repo.filename(format!("daemon-race-file-{idx}.txt").as_str());
-        file.assert_lines_and_blame(lines![format!("ai-line-{idx}").ai()]);
-    }
-}
-
-#[test]
-#[serial]
-fn daemon_pure_trace_socket_concurrent_worktree_burst_preserves_exact_line_attribution() {
-    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
-    let _daemon = DaemonGuard::start(&repo);
-    let trace_socket = daemon_trace_socket_path(&repo);
-    let env = git_trace_env(&trace_socket);
-    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
-
-    let harness = WorkdirRaceHarness::new(&repo, trace_socket.clone());
-    let worker_a_dir = repo.path().to_path_buf();
-    let worker_b_dir = unique_worktree_path(&repo, "daemon-race-worker-b");
-    let worker_b_dir_str = worker_b_dir.to_string_lossy().to_string();
-
-    repo.git_og_with_env(&["checkout", "-b", "daemon-race-worker-a"], &env_refs)
-        .expect("checkout worker-a branch should succeed");
-    repo.git_og_with_env(
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "daemon-race-worker-b",
-            worker_b_dir_str.as_str(),
-        ],
-        &env_refs,
-    )
-    .expect("worktree add worker-b should succeed");
-    wait_for_expected_top_level_completions(&repo, 0, 2);
-
-    let file_count = 10usize;
-    let completion_baseline = repo.daemon_total_completion_count();
-    let mut expected_completions = 0u64;
-    for idx in 0..file_count {
-        let file_a = format!("daemon-race-a-{idx}.txt");
-        harness.write_ai_line_checkpoint_and_add(
-            &worker_a_dir,
-            file_a.as_str(),
-            format!("a-ai-line-{idx}").as_str(),
-        );
-        expected_completions += 2; // checkpoint + add
-
-        let file_b = format!("daemon-race-b-{idx}.txt");
-        harness.write_ai_line_checkpoint_and_add(
-            &worker_b_dir,
-            file_b.as_str(),
-            format!("b-ai-line-{idx}").as_str(),
-        );
-        expected_completions += 2; // checkpoint + add
-    }
-
-    // Wait for all checkpoints and adds to complete before committing
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    harness.run_traced_git(&worker_a_dir, &["commit", "-m", "worker-a burst commit"]);
-    harness.run_traced_git(&worker_b_dir, &["commit", "-m", "worker-b burst commit"]);
-    expected_completions += 2; // both commits
-
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    for idx in 0..file_count {
-        let file_a = format!("daemon-race-a-{idx}.txt");
-        let file_b = format!("daemon-race-b-{idx}.txt");
-        assert_single_ai_line_for_workdir(
-            &repo,
-            &worker_a_dir,
-            file_a.as_str(),
-            format!("a-ai-line-{idx}").as_str(),
-        );
-        assert_single_ai_line_for_workdir(
-            &repo,
-            &worker_b_dir,
-            file_b.as_str(),
-            format!("b-ai-line-{idx}").as_str(),
-        );
-    }
-
-    let _ = repo.git_og_with_env(
-        &["worktree", "remove", "--force", worker_b_dir_str.as_str()],
-        &env_refs,
-    );
+    module_e.assert_committed_lines(lines!["class ModuleE:", "    pass"]);
 }
 
 #[test]
@@ -6066,10 +5254,11 @@ fn daemon_pure_trace_socket_concurrent_checkpoint_requests_preserve_exact_line_a
         expected.push((file_rel, line));
     }
 
+    let mut expected_completions = 0;
     #[cfg(windows)]
     {
         for (file_rel, _) in &expected {
-            harness.run_delegated_checkpoint(&workdir, file_rel.as_str());
+            expected_completions += harness.run_delegated_checkpoint(&workdir, file_rel.as_str());
         }
     }
     #[cfg(not(windows))]
@@ -6080,18 +5269,17 @@ fn daemon_pure_trace_socket_concurrent_checkpoint_requests_preserve_exact_line_a
             let harness = harness.clone();
             let file_rel = file_rel.clone();
             checkpoint_threads.push(thread::spawn(move || {
-                harness.run_delegated_checkpoint(&thread_workdir, file_rel.as_str());
+                harness.run_delegated_checkpoint(&thread_workdir, file_rel.as_str())
             }));
         }
         for handle in checkpoint_threads {
-            handle
+            expected_completions += handle
                 .join()
                 .expect("concurrent delegated checkpoint thread should not panic");
         }
     }
 
     // Wait for all concurrent checkpoints to complete before adding
-    let mut expected_completions = file_count as u64;
     wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
 
     repo.git_og_with_env(&["add", "."], &env_refs)
@@ -6107,115 +5295,12 @@ fn daemon_pure_trace_socket_concurrent_checkpoint_requests_preserve_exact_line_a
 
     wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
 
+    let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    repo.assert_commit_links(head.trim(), &[("codex", "daemon-test-session")]);
     for (file_rel, line) in expected {
         let mut file = repo.filename(file_rel.as_str());
-        file.assert_lines_and_blame(lines![line.ai()]);
+        file.assert_committed_lines(lines![line]);
     }
-}
-
-#[test]
-#[serial]
-fn daemon_pure_trace_socket_parallel_worktree_streams_preserve_exact_line_attribution() {
-    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
-    let _daemon = DaemonGuard::start(&repo);
-    let trace_socket = daemon_trace_socket_path(&repo);
-    let env = git_trace_env(&trace_socket);
-    let env_refs = [(env[0].0, env[0].1.as_str()), (env[1].0, env[1].1.as_str())];
-
-    let harness = WorkdirRaceHarness::new(&repo, trace_socket.clone());
-    let worker_a_dir = repo.path().to_path_buf();
-    let worker_b_dir = unique_worktree_path(&repo, "daemon-race-worker-b-parallel");
-    let worker_b_dir_str = worker_b_dir.to_string_lossy().to_string();
-
-    repo.git_og_with_env(
-        &["checkout", "-b", "daemon-race-parallel-worker-a"],
-        &env_refs,
-    )
-    .expect("checkout parallel worker-a branch should succeed");
-    repo.git_og_with_env(
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "daemon-race-parallel-worker-b",
-            worker_b_dir_str.as_str(),
-        ],
-        &env_refs,
-    )
-    .expect("worktree add parallel worker-b should succeed");
-    wait_for_expected_top_level_completions(&repo, 0, 2);
-
-    let file_count = 8usize;
-    let completion_baseline = repo.daemon_total_completion_count();
-
-    // Spawn threads to do checkpoint+add in parallel, but WITHOUT committing yet
-    let worker_a_harness = harness.clone();
-    let worker_a_dir_clone = worker_a_dir.clone();
-    let worker_a = thread::spawn(move || {
-        for idx in 0..file_count {
-            let file = format!("daemon-race-parallel-a-{idx}.txt");
-            let line = format!("a-parallel-ai-line-{idx}");
-            worker_a_harness.write_ai_line_checkpoint_and_add(
-                &worker_a_dir_clone,
-                file.as_str(),
-                line.as_str(),
-            );
-        }
-    });
-
-    let worker_b_harness = harness.clone();
-    let worker_b_dir_clone = worker_b_dir.clone();
-    let worker_b = thread::spawn(move || {
-        for idx in 0..file_count {
-            let file = format!("daemon-race-parallel-b-{idx}.txt");
-            let line = format!("b-parallel-ai-line-{idx}");
-            worker_b_harness.write_ai_line_checkpoint_and_add(
-                &worker_b_dir_clone,
-                file.as_str(),
-                line.as_str(),
-            );
-        }
-    });
-
-    worker_a
-        .join()
-        .expect("parallel worker-a thread should not panic");
-    worker_b
-        .join()
-        .expect("parallel worker-b thread should not panic");
-
-    // Wait for all checkpoints and adds to complete before committing
-    let mut expected_completions = (file_count as u64) * 2 * 2; // checkpoints + adds for both workers
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    // Now do the commits after all checkpoints are processed
-    harness.run_traced_git(&worker_a_dir, &["commit", "-m", "parallel worker-a commit"]);
-    harness.run_traced_git(&worker_b_dir, &["commit", "-m", "parallel worker-b commit"]);
-    expected_completions += 2; // both commits
-
-    wait_for_expected_top_level_completions(&repo, completion_baseline, expected_completions);
-
-    for idx in 0..file_count {
-        let file_a = format!("daemon-race-parallel-a-{idx}.txt");
-        let file_b = format!("daemon-race-parallel-b-{idx}.txt");
-        assert_single_ai_line_for_workdir(
-            &repo,
-            &worker_a_dir,
-            file_a.as_str(),
-            format!("a-parallel-ai-line-{idx}").as_str(),
-        );
-        assert_single_ai_line_for_workdir(
-            &repo,
-            &worker_b_dir,
-            file_b.as_str(),
-            format!("b-parallel-ai-line-{idx}").as_str(),
-        );
-    }
-
-    let _ = repo.git_og_with_env(
-        &["worktree", "remove", "--force", worker_b_dir_str.as_str()],
-        &env_refs,
-    );
 }
 
 // Daemon update check decision logic is tested by unit tests in
@@ -6342,27 +5427,12 @@ fn daemon_memory_threshold_logs_uploads_and_aborts_without_draining() {
             ("GIT_AI_API_KEY", "test-api-key"),
         ],
     );
-    let head = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
-
     fs::write(&file_path, "Untracked base\nAI before emergency\n").unwrap();
-    let request = CheckpointRequest {
-        trace_id: "memory-limit-checkpoint".to_string(),
-        checkpoint_kind: CheckpointKind::AiAgent,
-        agent_id: Some(AgentId {
-            tool: "mock_ai".to_string(),
-            id: "memory-limit-session".to_string(),
-            model: "test".to_string(),
-        }),
-        files: vec![CheckpointFile {
-            path: PathBuf::from("memory-emergency.txt"),
-            content: Some("Untracked base\nAI before emergency\n".to_string()),
-            repo_work_dir: repo.path().to_path_buf(),
-            base_commit: BaseCommit::Sha(head),
-        }],
-        path_role: PreparedPathRole::Edited,
-        stream_source: None,
-        metadata: Default::default(),
-    };
+    let request = checkpoint_request(
+        &repo,
+        "memory-limit-checkpoint".to_string(),
+        "memory-limit-session".to_string(),
+    );
     let checkpoint_response = send_checkpoint_request_with_timeout(
         &daemon.control_socket_path,
         &request,
@@ -7766,234 +6836,18 @@ fn daemon_drain_probes_do_not_disturb_attribution() {
     });
 
     let mut file = repo.filename("probe-noise.txt");
-    file.set_contents(lines!["human line", "ai line".ai()]);
+    file.set_contents(lines!["human line", "ai line"]);
+    file.repo
+        .git_ai(&native_checkpoint_args!(
+            file.file_path.to_string_lossy().as_ref()
+        ))
+        .unwrap();
     repo.stage_all_and_commit("commit under probe noise")
         .unwrap();
-    file.assert_lines_and_blame(lines!["human line".human(), "ai line".ai()]);
+    file.assert_committed_lines(lines!["human line", "ai line"]);
 
     stop_probes.store(true, Ordering::SeqCst);
     prober.join().unwrap();
-}
-
-/// Telemetry runs on its own runtime: an upload backend that stalls for the
-/// whole test must not delay checkpoint/commit processing or attribution.
-#[test]
-#[cfg(not(windows))]
-fn commit_attribution_unaffected_by_stalled_telemetry_uploads() {
-    let repo = TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_TELEMETRY_UPLOAD_STALL_MS", "60000")]);
-
-    // Deterministic: the stall hook logs when the flush loop enters the
-    // stalled upload; only then does the commit work begin.
-    let started = std::time::Instant::now();
-    loop {
-        if repo
-            .daemon_stderr_contents()
-            .contains("test telemetry upload stall engaged")
-        {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "telemetry upload stall never engaged:\n{}",
-            repo.daemon_stderr_contents()
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let mut file = repo.filename("stalled-telemetry.txt");
-    file.set_contents(lines!["human line", "ai line".ai()]);
-    repo.stage_all_and_commit("commit under stalled telemetry")
-        .unwrap();
-    file.assert_lines_and_blame(lines!["human line".human(), "ai line".ai()]);
-}
-
-/// An awaited flush must not certify completion while metric batches still
-/// sit in the persistence queue: they have to reach SQLite (and thus the
-/// upload path and the pending count) before `await` reports finished.
-/// Root cause of the macOS CI failure "expected at least one metrics upload,
-/// got 0" on this stack.
-#[test]
-#[cfg(not(windows))]
-fn await_blocks_until_queued_metrics_are_persisted() {
-    let mut mock_api = MockApiServer::start();
-    // tempdir: cleans up the DB and its WAL/SHM sidecars on all exits,
-    // including assertion failures.
-    let metrics_db_dir = tempfile::tempdir().expect("failed to create metrics db dir");
-    let metrics_db_path = metrics_db_dir.path().join("metrics.db");
-    let mut repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-        // Every queued metric batch takes 1s to persist: an await issued
-        // right after a commit races still-queued batches (kept below the
-        // 10s drain deadline even with several batches on a slow runner).
-        ("GIT_AI_TEST_METRICS_PERSIST_DELAY_MS", "1000"),
-    ]);
-    repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
-        patch.telemetry_oss_disabled = Some(true);
-    });
-
-    let repo_root = repo.canonical_path();
-    let file_path = repo_root.join("test.ts");
-    fs::write(&file_path, "const x = 1;\n").expect("failed to write initial file");
-    repo.git_ai(&["checkpoint", "mock_known_human", "test.ts"])
-        .expect("known-human checkpoint should succeed");
-    fs::write(&file_path, "const x = 2;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_ai", "test.ts"])
-        .expect("ai checkpoint should succeed");
-    repo.git(&["add", "-A"]).expect("add should succeed");
-    repo.git(&["commit", "-m", "Commit with delayed metric persistence"])
-        .expect("commit should succeed");
-
-    let output = repo
-        .git_ai(&["await", "--timeout", "60"])
-        .expect("await should succeed");
-    assert!(
-        output.contains("finished"),
-        "await should report finished: {}",
-        output
-    );
-
-    let requests = mock_api.collect_requests();
-    let metrics_requests = requests
-        .iter()
-        .filter(|r| r["path"].as_str() == Some("/worker/metrics/upload"))
-        .count();
-    assert!(
-        metrics_requests > 0,
-        "await certified the flush while metric batches were still queued: got {} metrics uploads\nawait output:\n{}\ndaemon log:\n{}",
-        metrics_requests,
-        output,
-        repo.daemon_stderr_contents()
-    );
-}
-
-/// The `notes.flush` control trigger must route through the serialized flush
-/// loop. A bare concurrent `flush_notes` dequeue-locks the note rows
-/// (`processing_started_at`) out from under an awaited flush, whose pending
-/// count excludes locked rows — so `await` certifies "0 notes remaining"
-/// while the triggered upload has not reached the backend yet. This test
-/// sends the trigger the way production does (an external control client,
-/// since the daemon's own in-process `submit_notes` is a deliberate no-op)
-/// and awaits during the stalled upload. Timing caveat: the 3s periodic
-/// cycle can occasionally win the dequeue instead of the trigger, in which
-/// case the run does not exercise the race — it still asserts the invariant.
-#[test]
-#[cfg(not(windows))]
-fn await_reflects_triggered_notes_flush() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_dir = tempfile::tempdir().expect("failed to create metrics db dir");
-    let metrics_db_path = metrics_db_dir.path().join("metrics.db");
-    let mut repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        ("GIT_AI_NOTES_BACKEND_KIND", "http"),
-        ("GIT_AI_NOTES_BACKEND_URL", mock_api.base_url()),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-        // The triggered flush holds the dequeued note rows locked for 8s
-        // before uploading — the window `await` must not certify across.
-        ("GIT_AI_TEST_NOTES_UPLOAD_STALL_MS", "8000"),
-    ]);
-    repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
-        patch.telemetry_oss_disabled = Some(true);
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::Http,
-            backend_url: Some(mock_api.base_url().to_string()),
-        });
-    });
-
-    let repo_root = repo.canonical_path();
-    let file_path = repo_root.join("test.ts");
-    fs::write(&file_path, "const x = 1;\n").expect("failed to write initial file");
-    repo.git_ai(&["checkpoint", "mock_known_human", "test.ts"])
-        .expect("known-human checkpoint should succeed");
-    fs::write(&file_path, "const x = 2;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_ai", "test.ts"])
-        .expect("ai checkpoint should succeed");
-    repo.git(&["add", "-A"]).expect("add should succeed");
-    repo.git(&["commit", "-m", "Commit whose note flush is in flight"])
-        .expect("commit should succeed");
-
-    // Fire the notes.flush trigger from outside the daemon (as production
-    // clients do) until the note row exists and a flush enters its stalled
-    // upload; triggers before the row lands are cheap no-ops (the stall hook
-    // only engages with rows dequeued).
-    let control_socket_path = daemon_control_socket_path(&repo);
-    let started = std::time::Instant::now();
-    loop {
-        let _ = send_control_request(&control_socket_path, &ControlRequest::FlushNotes);
-        if repo
-            .daemon_stderr_contents()
-            .contains("test notes upload stall engaged")
-        {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "notes upload stall never engaged:\n{}",
-            repo.daemon_stderr_contents()
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Await while the triggered upload is stalled with the note rows locked.
-    let output = repo
-        .git_ai(&["await", "--timeout", "60"])
-        .expect("await should succeed");
-    assert!(
-        output.contains("finished"),
-        "await should report finished: {}",
-        output
-    );
-
-    let requests = mock_api.collect_requests();
-    let notes_requests = requests
-        .iter()
-        .filter(|r| r["path"].as_str() == Some("/worker/notes/upload"))
-        .count();
-    assert!(
-        notes_requests > 0,
-        "await certified while the triggered notes upload was still in flight: got {} notes uploads\ndaemon log:\n{}",
-        notes_requests,
-        repo.daemon_stderr_contents()
-    );
-}
-
-/// The telemetry flush loop runs every 3 seconds, so its skip reasons
-/// ("not authenticated", "backend is not Http", ...) must log at debug, not
-/// INFO — an unauthenticated or default-config daemon would otherwise write
-/// tens of thousands of identical INFO lines per day into its log file.
-#[test]
-fn daemon_flush_skip_reasons_do_not_log_at_info() {
-    // Default test repo: no API key, GitNotes backend — every flush pass
-    // skips both the metrics upload and the notes flush.
-    let repo = TestRepo::new();
-    let control_socket_path = daemon_control_socket_path(&repo);
-
-    // Each trigger runs one serialized flush pass in the telemetry loop.
-    for _ in 0..3 {
-        send_control_request(&control_socket_path, &ControlRequest::FlushNotes)
-            .expect("flush trigger should be accepted");
-        thread::sleep(Duration::from_millis(300));
-    }
-
-    let logs = repo.daemon_stderr_contents();
-    for needle in ["metrics: skipping pending upload", "notes: skipping flush"] {
-        assert!(
-            !logs.contains(needle),
-            "flush skip reason {needle:?} should not appear at the default log level:\n{logs}"
-        );
-    }
 }
 
 /// A control client that connects and vanishes (times out, dies mid-request)
@@ -8064,99 +6918,6 @@ fn control_peer_disconnect_not_logged_as_error() {
         "abandoned control peers must not be logged as connection failures:\n{logs}"
     );
     daemon.shutdown();
-}
-
-/// Every ingest loss must reach fleet telemetry: the teardown report persists
-/// a DaemonIngestAnomaly event with delta values straight to the metrics DB,
-/// even when the daemon never survived until a periodic health report.
-#[test]
-#[serial]
-#[cfg(not(windows))]
-fn daemon_ingest_losses_reported_to_metrics_db_on_shutdown() {
-    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
-    let control_socket_path = daemon_control_socket_path(&repo);
-    let trace_socket_path = daemon_trace_socket_path(&repo);
-    let metrics_db_dir = tempfile::tempdir().expect("failed to create metrics db dir");
-    let metrics_db_path = metrics_db_dir.path().join("metrics.db");
-
-    let mut daemon = DaemonGuard::start_with_env(
-        &repo,
-        &[
-            ("GIT_AI_TEST_TRACE_CONNECTION_SPAWN_FAILURES", "3"),
-            (
-                "GIT_AI_TEST_METRICS_DB_PATH",
-                metrics_db_path.to_str().unwrap(),
-            ),
-        ],
-    );
-
-    // Readiness consumed one injected failure; drop two more connections.
-    for _ in 0..2 {
-        let mut stream =
-            open_local_socket_stream_with_timeout(&trace_socket_path, DAEMON_TEST_PROBE_TIMEOUT)
-                .expect("failed to open trace connection");
-        let started = std::time::Instant::now();
-        while started.elapsed() < Duration::from_secs(2) {
-            if stream
-                .write_all(b"\n")
-                .and_then(|_| stream.flush())
-                .is_err()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let _ = send_control_request(&control_socket_path, &ControlRequest::Shutdown);
-    daemon.shutdown();
-
-    let db = MetricsDatabase::open_at_path(&metrics_db_path)
-        .expect("metrics db should open at isolated path");
-    let records = db
-        .get_metric_history(0, None, &[8u16])
-        .expect("metric history should load");
-    assert_eq!(
-        records.len(),
-        1,
-        "exactly one DaemonIngestAnomaly report expected, got {}",
-        records.len()
-    );
-    let values = &records[0].event.values;
-    let connections_dropped = values.get("1").and_then(Value::as_u64);
-    assert_eq!(
-        connections_dropped,
-        Some(3),
-        "the report must carry delta values: {values:?}"
-    );
-    drop(db);
-
-    // Control scenario: a daemon with no losses must not emit the event.
-    let clean_repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
-    let clean_metrics_db_path = metrics_db_dir.path().join("clean-metrics.db");
-    let mut clean_daemon = DaemonGuard::start_with_env(
-        &clean_repo,
-        &[(
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            clean_metrics_db_path.to_str().unwrap(),
-        )],
-    );
-    let _ = send_control_request(
-        &daemon_control_socket_path(&clean_repo),
-        &ControlRequest::Shutdown,
-    );
-    clean_daemon.shutdown();
-
-    let clean_db = MetricsDatabase::open_at_path(&clean_metrics_db_path)
-        .expect("clean metrics db should open");
-    let clean_records = clean_db
-        .get_metric_history(0, None, &[8u16])
-        .expect("metric history should load");
-    assert!(
-        clean_records.is_empty(),
-        "a daemon with no losses must not emit DaemonIngestAnomaly: {} records",
-        clean_records.len()
-    );
 }
 
 /// Dropped trace connections are counted and reported through stats.ingest,
@@ -8281,93 +7042,6 @@ fn trace_queue_full_drop_logs_the_dropped_root() {
 }
 
 #[test]
-fn await_waits_for_metrics_and_notes_flush() {
-    let mut mock_api = MockApiServer::start();
-
-    // Metrics recording is gated in test builds; point it at an isolated DB so
-    // post-commit metric events actually get stored and flushed.
-    let metrics_db_path =
-        std::env::temp_dir().join(format!("git-ai-test-metrics-{}.db", std::process::id()));
-    let mut repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        ("GIT_AI_NOTES_BACKEND_KIND", "http"),
-        ("GIT_AI_NOTES_BACKEND_URL", mock_api.base_url()),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    repo.patch_git_ai_config(|patch| {
-        patch.exclude_prompts_in_repositories = Some(vec![]);
-        patch.prompt_storage = Some("default".to_string());
-        patch.telemetry_oss_disabled = Some(true);
-        patch.notes_backend = Some(NotesBackendConfig {
-            kind: NotesBackendKind::Http,
-            backend_url: Some(mock_api.base_url().to_string()),
-        });
-    });
-
-    let repo_root = repo.canonical_path();
-    let file_path = repo_root.join("test.ts");
-
-    // First commit: known-human baseline, then an AI-style edit to produce metrics.
-    fs::write(&file_path, "const x = 1;\n").expect("failed to write initial file");
-    repo.git_ai(&["checkpoint", "mock_known_human", "test.ts"])
-        .expect("known-human checkpoint should succeed");
-    fs::write(&file_path, "const x = 2;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_ai", "test.ts"])
-        .expect("ai checkpoint should succeed");
-    repo.git(&["add", "-A"])
-        .expect("initial add should succeed");
-    repo.git(&["commit", "-m", "Initial commit"])
-        .expect("initial commit should succeed");
-
-    // Second commit: repeat the same pattern to queue more metrics and notes.
-    fs::write(&file_path, "const x = 3;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_known_human", "test.ts"])
-        .expect("known-human checkpoint should succeed");
-    fs::write(&file_path, "const x = 4;\n").expect("failed to write update");
-    repo.git_ai(&["checkpoint", "mock_ai", "test.ts"])
-        .expect("ai checkpoint should succeed");
-    repo.git(&["add", "-A"]).expect("second add should succeed");
-    repo.git(&["commit", "-m", "Second commit"])
-        .expect("second commit should succeed");
-
-    // Wait for the daemon to finish and flush telemetry.
-    let output = repo
-        .git_ai(&["await", "--timeout", "30"])
-        .expect("await should succeed");
-    assert!(
-        output.contains("finished"),
-        "await should report finished: {}",
-        output
-    );
-
-    let requests = mock_api.collect_requests();
-    let metrics_requests = requests
-        .iter()
-        .filter(|r| r["path"].as_str() == Some("/worker/metrics/upload"))
-        .count();
-    let notes_requests = requests
-        .iter()
-        .filter(|r| r["path"].as_str() == Some("/worker/notes/upload"))
-        .count();
-    assert!(
-        metrics_requests > 0,
-        "expected at least one metrics upload, got {}\ndaemon log:\n{}",
-        metrics_requests,
-        repo.daemon_stderr_contents()
-    );
-    assert!(
-        notes_requests > 0,
-        "expected at least one notes upload, got {}\ndaemon log:\n{}",
-        notes_requests,
-        repo.daemon_stderr_contents()
-    );
-}
-
-#[test]
 fn daemon_debug_logging_does_not_reupload_ureq_logs() {
     let mut mock_api = MockApiServer::start();
     let repo = TestRepo::new_with_daemon_env(&[
@@ -8418,368 +7092,6 @@ fn daemon_debug_logging_does_not_reupload_ureq_logs() {
             .iter()
             .all(|target| *target != "ureq" && !target.starts_with("ureq::")),
         "ureq logs generated by daemon log delivery must not be uploaded: {uploaded_targets:?}"
-    );
-}
-
-#[test]
-fn daemon_marks_repository_filtered_session_events_delivered_without_uploading_them() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_path = std::env::temp_dir().join(format!(
-        "git-ai-filtered-session-events-{}.db",
-        git_ai::uuid::generate_v4()
-    ));
-    let repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    fs::write(
-        repo.test_home_path().join(".git-ai/config.json"),
-        r#"{"allow_repositories":["https://github.com/acme/*"],"exclude_repositories":["git@github.com:acme/private"]}"#,
-    )
-    .unwrap();
-
-    let session_event = |trace_id: &str, repo_url: &str| {
-        MetricEvent::from_values(
-            SessionEventValues::new(json!({ "marker": trace_id })),
-            EventAttributes::with_version("test")
-                .session_id(trace_id)
-                .trace_id(trace_id)
-                .repo_url(repo_url)
-                .to_sparse(),
-        )
-    };
-    let events = [
-        session_event("allowed-session", "https://github.com/acme/public"),
-        session_event("excluded-session", "https://github.com/acme/private"),
-    ];
-    let serialized_events = events
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    MetricsDatabase::open_at_path(&metrics_db_path)
-        .unwrap()
-        .insert_events(&serialized_events)
-        .unwrap();
-
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("await should flush metrics");
-
-    let uploaded_requests = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(uploaded_requests.contains("allowed-session"));
-    assert!(!uploaded_requests.contains("excluded-session"));
-
-    let metrics_db = MetricsDatabase::open_at_path(&metrics_db_path).unwrap();
-    let status = metrics_db.status().unwrap();
-    assert_eq!(status.delivered, 2);
-}
-
-/// TokenUsage events are transcript-derived like SessionEvents and get the
-/// same upload-time repo gate: sessions tracked before a repo was excluded
-/// keep producing them, so exclusion must apply at delivery.
-#[test]
-fn daemon_marks_repository_filtered_token_usage_events_delivered_without_uploading_them() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_path = std::env::temp_dir().join(format!(
-        "git-ai-filtered-token-usage-events-{}.db",
-        git_ai::uuid::generate_v4()
-    ));
-    let repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    fs::write(
-        repo.test_home_path().join(".git-ai/config.json"),
-        r#"{"allow_repositories":["https://github.com/acme/*"],"exclude_repositories":["git@github.com:acme/private"]}"#,
-    )
-    .unwrap();
-
-    let token_usage_event = |session_id: &str, repo_url: &str| {
-        MetricEvent::from_values(
-            TokenUsageValues::new()
-                .bucket_ts(1_767_225_600)
-                .input_tokens(10)
-                .output_tokens(5)
-                .total_tokens(15)
-                .est_cost_micro_usd(100)
-                .message_count(1),
-            EventAttributes::with_version("test")
-                .session_id(session_id)
-                .tool("claude")
-                .model("claude-sonnet-4")
-                .repo_url(repo_url)
-                .to_sparse(),
-        )
-    };
-    let events = [
-        token_usage_event("allowed-usage", "https://github.com/acme/public"),
-        token_usage_event("excluded-usage", "https://github.com/acme/private"),
-    ];
-    let serialized_events = events
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    MetricsDatabase::open_at_path(&metrics_db_path)
-        .unwrap()
-        .insert_events(&serialized_events)
-        .unwrap();
-
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("await should flush metrics");
-
-    let uploaded_requests = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(uploaded_requests.contains("allowed-usage"));
-    assert!(!uploaded_requests.contains("excluded-usage"));
-
-    let metrics_db = MetricsDatabase::open_at_path(&metrics_db_path).unwrap();
-    let status = metrics_db.status().unwrap();
-    assert_eq!(status.delivered, 2);
-}
-
-#[test]
-fn reingest_command_redelivers_bounded_and_all_metrics_through_daemon() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_dir = tempfile::tempdir().expect("reingest metrics temp directory");
-    let metrics_db_path = metrics_db_dir.path().join("metrics.db");
-    let repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as u32;
-    let event = |timestamp: u32, marker: &str| {
-        MetricEvent::with_timestamp(
-            timestamp,
-            &SessionEventValues::new(json!({ "marker": marker })),
-            EventAttributes::with_version("test")
-                .session_id(marker)
-                .trace_id(marker)
-                .to_sparse(),
-        )
-    };
-    let events = [
-        event(now - 300, "before-window"),
-        event(now - 200, "inside-window"),
-        event(now - 100, "after-window"),
-    ];
-    let serialized = events
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    MetricsDatabase::open_at_path(&metrics_db_path)
-        .unwrap()
-        .insert_events_with_delivered_ts(&serialized, Some(u64::from(now)))
-        .unwrap();
-
-    let format_time = |timestamp| {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(i64::from(timestamp), 0)
-            .unwrap()
-            .to_rfc3339()
-    };
-    let output = repo
-        .git_ai(&[
-            "reingest",
-            "--from",
-            &format_time(now - 250),
-            "--to",
-            &format_time(now - 150),
-        ])
-        .expect("bounded reingestion should succeed");
-    assert!(output.contains("reset 1 metric event(s)"), "{output}");
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("daemon should deliver the bounded reingestion");
-
-    let bounded_uploads = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(bounded_uploads.contains("inside-window"));
-    assert!(!bounded_uploads.contains("before-window"));
-    assert!(!bounded_uploads.contains("after-window"));
-
-    let output = repo
-        .git_ai(&["reingest", "--all"])
-        .expect("all-time reingestion should succeed");
-    assert!(output.contains("reset 3 metric event(s)"), "{output}");
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("daemon should deliver the all-time reingestion");
-
-    let all_uploads = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(all_uploads.contains("before-window"));
-    assert!(all_uploads.contains("inside-window"));
-    assert!(all_uploads.contains("after-window"));
-    assert_eq!(
-        MetricsDatabase::open_at_path(&metrics_db_path)
-            .unwrap()
-            .status()
-            .unwrap()
-            .delivered,
-        3
-    );
-}
-
-/// Pins the fail-open semantics for TokenUsage events with NO repo_url under
-/// an exclude-only config: they upload (matching SessionEvent semantics -
-/// exclusion needs a URL to match). The worker minimizes this window by
-/// resolving repo_url with the infer_cwd fallback and persisting it for
-/// DB-only corrections; sessions that never resolve one are indistinguishable
-/// from non-repo work.
-#[test]
-fn token_usage_without_repo_url_passes_an_exclude_only_gate() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_path = std::env::temp_dir().join(format!(
-        "git-ai-no-repo-token-usage-{}.db",
-        git_ai::uuid::generate_v4()
-    ));
-    let repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    fs::write(
-        repo.test_home_path().join(".git-ai/config.json"),
-        r#"{"exclude_repositories":["git@github.com:acme/private"]}"#,
-    )
-    .unwrap();
-
-    let event = MetricEvent::from_values(
-        TokenUsageValues::new()
-            .bucket_ts(1_767_225_600)
-            .input_tokens(10)
-            .total_tokens(10)
-            .message_count(1),
-        EventAttributes::with_version("test")
-            .session_id("no-repo-usage")
-            .tool("claude")
-            .model("claude-sonnet-4")
-            .to_sparse(),
-    );
-    MetricsDatabase::open_at_path(&metrics_db_path)
-        .unwrap()
-        .insert_events(&[serde_json::to_string(&event).unwrap()])
-        .unwrap();
-
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("await should flush metrics");
-
-    let uploaded_requests = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(
-        uploaded_requests.contains("no-repo-usage"),
-        "no-repo_url events upload under exclude-only configs (documented fail-open)"
-    );
-}
-
-/// The exclude gate through the REAL pipeline: with the repo's remote in
-/// exclude_repositories, the checkpoint-time gate refuses tracking outright
-/// (defense layer 1), so no TokenUsage events are even produced - and
-/// nothing crosses the wire. (The upload-time gate above is defense layer 2,
-/// for sessions tracked BEFORE a repo was excluded.)
-#[test]
-fn excluded_repo_token_usage_never_uploads_via_the_real_pipeline() {
-    let mut mock_api = MockApiServer::start();
-    let metrics_db_path = std::env::temp_dir().join(format!(
-        "git-ai-excluded-pipeline-token-usage-{}.db",
-        git_ai::uuid::generate_v4()
-    ));
-    let repo = TestRepo::new_with_daemon_env(&[
-        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
-        ("GIT_AI_API_KEY", "test-api-key"),
-        (
-            "GIT_AI_TEST_METRICS_DB_PATH",
-            metrics_db_path.to_str().unwrap(),
-        ),
-    ]);
-    fs::write(
-        repo.test_home_path().join(".git-ai/config.json"),
-        r#"{"exclude_repositories":["https://github.com/acme/private"]}"#,
-    )
-    .unwrap();
-    repo.git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://github.com/acme/private.git",
-    ])
-    .expect("remote add should succeed");
-    repo.git(&["commit", "--allow-empty", "-m", "initial"])
-        .expect("initial commit should succeed");
-    let repo_root = repo.canonical_path();
-
-    let transcript_path = repo_root.join("claude-session.jsonl");
-    fs::write(
-        &transcript_path,
-        r#"{"timestamp":"2026-08-23T00:01:00Z","sessionId":"ext","requestId":"r1","message":{"id":"m1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
-"#,
-    )
-    .unwrap();
-    let file_path = repo_root.join("example.ts");
-    fs::write(
-        &file_path,
-        "const x = 1;
-",
-    )
-    .unwrap();
-    for hook_event_name in ["PreToolUse", "PostToolUse"] {
-        let hook_input = serde_json::json!({
-            "cwd": repo_root.to_string_lossy(),
-            "hook_event_name": hook_event_name,
-            "tool_name": "Write",
-            "tool_use_id": "toolu_excluded",
-            "session_id": "sess-excluded",
-            "transcript_path": transcript_path.to_string_lossy(),
-            "tool_input": { "file_path": file_path.to_string_lossy() }
-        })
-        .to_string();
-        repo.git_ai(&["checkpoint", "claude", "--hook-input", &hook_input])
-            .expect("checkpoint should succeed");
-        if hook_event_name == "PreToolUse" {
-            fs::write(
-                &file_path,
-                "const x = 1;
-const y = 2;
-",
-            )
-            .unwrap();
-        }
-    }
-    repo.git_ai(&["await", "--timeout", "30"])
-        .expect("await should flush metrics");
-
-    // The checkpoint-time gate refused tracking: no TokenUsage events were
-    // produced at all for the excluded repo...
-    let db = MetricsDatabase::open_at_path(&metrics_db_path).unwrap();
-    let produced = db
-        .get_metric_history(
-            0,
-            None,
-            &[git_ai::metrics::types::MetricEventId::TokenUsage as u16],
-        )
-        .unwrap();
-    assert!(
-        produced.is_empty(),
-        "an excluded repo must not be tracked at all"
-    );
-    // ...and nothing crossed the wire.
-    let uploaded_requests = serde_json::to_string(&mock_api.collect_requests()).unwrap();
-    assert!(
-        !uploaded_requests.contains("sess-excluded"),
-        "excluded repo token usage must never upload"
     );
 }
 

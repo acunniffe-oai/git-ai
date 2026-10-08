@@ -3,7 +3,7 @@ use git_ai::{daemon::DaemonConfig, diagnostic_sentinels::DEBUG_SELF_CHECK_DIR_NA
 use std::fs;
 
 #[test]
-fn attribution_self_checks_do_not_timeout() {
+fn session_link_self_checks_do_not_timeout() {
     let repo = TestRepo::new();
     let slow_git = repo.test_home_path().join(if cfg!(windows) {
         "slow-git.exe"
@@ -16,8 +16,6 @@ fn attribution_self_checks_do_not_timeout() {
         config_path,
         serde_json::json!({
             "git_path": slow_git,
-            "prompt_storage": "notes",
-            "exclude_prompts_in_repositories": [],
             "disable_version_checks": true
         })
         .to_string(),
@@ -50,11 +48,11 @@ fn attribution_self_checks_do_not_timeout() {
     );
     let passed_checks = report
         .lines()
-        .filter(|line| line.contains("Attribution self-check: passed"))
+        .filter(|line| line.contains("Session-link self-check: passed"))
         .count();
     assert_eq!(
         passed_checks, 2,
-        "configured and terminal git attribution checks should pass:\n{report}"
+        "configured and terminal Git session-link checks should pass:\n{report}"
     );
     let daemon_self_check_root = repo
         .daemon_home_path()
@@ -67,15 +65,14 @@ fn attribution_self_checks_do_not_timeout() {
         2,
         "both self-check repositories should use the active daemon home:\n{report}"
     );
-    for expected_line in [
-        "line 1: untracked (expected untracked",
-        "line 2: known_human (expected known_human",
-        "line 3: ai (expected ai",
-    ] {
-        assert_eq!(
-            report.matches(expected_line).count(),
-            2,
-            "both attribution checks should validate {expected_line}:\n{report}"
-        );
-    }
+    assert_eq!(
+        report.matches("linked sessions: 1").count(),
+        2,
+        "both checks must inspect exactly one durable session link: {report}"
+    );
+    assert_eq!(
+        report.matches("session: claude-code/git-ai-debug-").count(),
+        2,
+        "native session IDs should be visible in diagnostic evidence: {report}"
+    );
 }

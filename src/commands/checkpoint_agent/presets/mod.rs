@@ -1,7 +1,6 @@
 pub mod parse;
 
 mod agent_v1;
-mod ai_tab;
 mod amp;
 mod claude;
 mod cline;
@@ -12,27 +11,20 @@ mod droid;
 mod firebender;
 mod gemini;
 mod github_copilot;
-mod human;
-mod known_human;
-mod mock_ai;
-mod mock_known_human;
 mod opencode;
 mod pi;
 mod windsurf;
 
-use crate::authorship::working_log::AgentId;
 use crate::error::GitAiError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetContext {
-    pub agent_id: AgentId,
+    pub agent: String,
     pub external_session_id: String,
     pub trace_id: String,
     pub cwd: PathBuf,
-    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,15 +33,12 @@ pub enum ParsedHookEvent {
     PostFileEdit(PostFileEdit),
     PreBashCall(PreBashCall),
     PostBashCall(PostBashCall),
-    KnownHumanEdit(KnownHumanEdit),
-    UntrackedEdit(UntrackedEdit),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreFileEdit {
     pub context: PresetContext,
     pub file_paths: Vec<PathBuf>,
-    pub dirty_files: Option<HashMap<PathBuf, String>>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
 }
@@ -58,26 +47,8 @@ pub struct PreFileEdit {
 pub struct PostFileEdit {
     pub context: PresetContext,
     pub file_paths: Vec<PathBuf>,
-    pub dirty_files: Option<HashMap<PathBuf, String>>,
-    pub stream_source: Option<StreamSource>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnownHumanEdit {
-    pub trace_id: String,
-    pub cwd: PathBuf,
-    pub file_paths: Vec<PathBuf>,
-    pub dirty_files: Option<HashMap<PathBuf, String>>,
-    pub editor_metadata: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UntrackedEdit {
-    pub trace_id: String,
-    pub cwd: PathBuf,
-    pub file_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,63 +65,13 @@ pub struct PostBashCall {
     pub tool_use_id: String,
     #[serde(default)]
     pub command: Option<String>,
-    pub stream_source: Option<StreamSource>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamSource {
-    pub path: PathBuf,
-    pub format: StreamFormat,
-    /// Session ID for this transcript (used to query/create session in DB).
-    pub session_id: String,
-    /// External thread/conversation ID (agent-specific identifier).
-    pub external_session_id: String,
-    /// Parent session ID for subagent transcripts.
-    #[serde(default)]
-    pub external_parent_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StreamFormat {
-    ClaudeJsonl,
-    ContinueJson,
-    GeminiJsonl,
-    WindsurfJsonl,
-    CodexJsonl,
-    CursorJsonl,
-    DroidJsonl,
-    CopilotSessionJson,
-    CopilotEventStreamJsonl,
-    AmpThreadJson,
-    OpenCodeSqlite,
-    PiJsonl,
-}
-
-impl StreamFormat {
-    pub fn watermark_type(self) -> crate::streams::watermark::WatermarkType {
-        use crate::streams::watermark::WatermarkType;
-        match self {
-            Self::ClaudeJsonl
-            | Self::CursorJsonl
-            | Self::GeminiJsonl
-            | Self::WindsurfJsonl
-            | Self::CodexJsonl
-            | Self::PiJsonl
-            | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
-            Self::DroidJsonl => WatermarkType::Hybrid,
-            Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
-                WatermarkType::RecordIndex
-            }
-            Self::OpenCodeSqlite => WatermarkType::Timestamp,
-        }
-    }
 }
 
 pub trait AgentPreset {
     fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError>;
 }
 
-pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
+fn resolve_native_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
     match name {
         "claude" => Ok(Box::new(claude::ClaudePreset)),
         "cline" => Ok(Box::new(cline::ClinePreset)),
@@ -162,16 +83,73 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
         "cursor-background" => Ok(Box::new(cursor::CursorBackgroundPreset)),
         "github-copilot" => Ok(Box::new(github_copilot::GithubCopilotPreset)),
         "amp" => Ok(Box::new(amp::AmpPreset)),
-        "ai_tab" => Ok(Box::new(ai_tab::AiTabPreset)),
         "firebender" => Ok(Box::new(firebender::FirebenderPreset)),
         "agent-v1" => Ok(Box::new(agent_v1::AgentV1Preset)),
         "droid" => Ok(Box::new(droid::DroidPreset)),
         "opencode" => Ok(Box::new(opencode::OpenCodePreset)),
         "pi" => Ok(Box::new(pi::PiPreset)),
-        "human" => Ok(Box::new(human::HumanPreset)),
-        "mock_ai" => Ok(Box::new(mock_ai::MockAiPreset)),
-        "known_human" => Ok(Box::new(known_human::KnownHumanPreset)),
-        "mock_known_human" => Ok(Box::new(mock_known_human::MockKnownHumanPreset)),
         _ => Err(GitAiError::PresetError(format!("Unknown preset: {}", name))),
     }
+}
+
+/// Every native format passes the same identity and failed-tool checks.
+struct ValidatedPreset(Box<dyn AgentPreset>);
+
+impl AgentPreset for ValidatedPreset {
+    fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
+        let failed = serde_json::from_str::<serde_json::Value>(hook_input)
+            .is_ok_and(|data| hook_failed(&data));
+        let mut events = self.0.parse(hook_input, trace_id)?;
+        events.retain(|event| {
+            // A shell command can write successfully before returning nonzero;
+            // its post hook must still close the invocation and compare stats.
+            if failed && matches!(event, ParsedHookEvent::PostFileEdit(_)) {
+                return false;
+            }
+            let context = match event {
+                ParsedHookEvent::PreFileEdit(e) => &e.context,
+                ParsedHookEvent::PostFileEdit(e) => &e.context,
+                ParsedHookEvent::PreBashCall(e) => &e.context,
+                ParsedHookEvent::PostBashCall(e) => &e.context,
+            };
+            crate::commit_links::store::SessionIdentity::new(
+                &context.agent,
+                &context.external_session_id,
+            )
+            .is_some()
+        });
+        Ok(events)
+    }
+}
+
+fn hook_failed(data: &serde_json::Value) -> bool {
+    let event = parse::optional_str_multi(data, &["hook_event_name", "hookEventName", "hook_name"]);
+    if event.is_some_and(|name| name.to_ascii_lowercase().contains("failure")) {
+        return true;
+    }
+    for value in [
+        Some(data),
+        data.get("tool_response"),
+        data.get("toolResponse"),
+        data.get("tool_result"),
+        data.get("postToolUse"),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        if value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true)
+            || value.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+            || value
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|code| code != 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
+    Ok(Box::new(ValidatedPreset(resolve_native_preset(name)?)))
 }

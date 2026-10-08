@@ -1,13 +1,10 @@
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext,
 };
-use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct OpenCodePreset;
@@ -125,117 +122,6 @@ impl OpenCodePreset {
 
         Some(joined.to_string_lossy().replace('\\', "/"))
     }
-
-    fn resolve_stream_source(session_id: &str) -> Option<(StreamSource, PathBuf)> {
-        let opencode_path = if let Ok(test_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
-            PathBuf::from(test_path)
-        } else {
-            Self::opencode_data_path().ok()?
-        };
-
-        // Try sqlite first
-        let db_path = Self::resolve_sqlite_db_path(&opencode_path);
-        if let Some(db_path) = db_path {
-            let parent_id = Self::lookup_parent_session(&db_path, session_id);
-            return Some((
-                StreamSource {
-                    path: db_path,
-                    format: StreamFormat::OpenCodeSqlite,
-                    session_id: generate_session_id(session_id, "opencode"),
-                    external_session_id: session_id.to_string(),
-                    external_parent_session_id: parent_id,
-                },
-                opencode_path,
-            ));
-        }
-
-        None
-    }
-
-    fn lookup_parent_session(db_path: &Path, session_id: &str) -> Option<String> {
-        let conn = crate::streams::agents::opencode::open_sqlite_readonly(db_path).ok()?;
-        conn.query_row(
-            "SELECT parent_id FROM session WHERE id = ?",
-            [session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-    }
-
-    fn opencode_data_path() -> Result<PathBuf, GitAiError> {
-        #[cfg(target_os = "macos")]
-        {
-            let home = dirs::home_dir().ok_or_else(|| {
-                GitAiError::Generic("Could not determine home directory".to_string())
-            })?;
-            Ok(home.join(".local").join("share").join("opencode"))
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
-                Ok(PathBuf::from(xdg_data).join("opencode"))
-            } else {
-                let home = dirs::home_dir().ok_or_else(|| {
-                    GitAiError::Generic("Could not determine home directory".to_string())
-                })?;
-                Ok(home.join(".local").join("share").join("opencode"))
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            if let Ok(app_data) = std::env::var("APPDATA") {
-                Ok(PathBuf::from(app_data).join("opencode"))
-            } else if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                Ok(PathBuf::from(local_app_data).join("opencode"))
-            } else {
-                Err(GitAiError::Generic(
-                    "Neither APPDATA nor LOCALAPPDATA is set".to_string(),
-                ))
-            }
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            Err(GitAiError::PresetError(
-                "OpenCode storage path not supported on this platform".to_string(),
-            ))
-        }
-    }
-
-    fn resolve_sqlite_db_path(path: &Path) -> Option<PathBuf> {
-        if path.is_file() {
-            return path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| *name == "opencode.db")
-                .map(|_| path.to_path_buf());
-        }
-
-        if !path.is_dir() {
-            return None;
-        }
-
-        let direct_db = path.join("opencode.db");
-        if direct_db.exists() {
-            return Some(direct_db);
-        }
-
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "storage")
-        {
-            let sibling_db = path.parent()?.join("opencode.db");
-            if sibling_db.exists() {
-                return Some(sibling_db);
-            }
-        }
-
-        None
-    }
 }
 
 impl AgentPreset for OpenCodePreset {
@@ -243,11 +129,15 @@ impl AgentPreset for OpenCodePreset {
         let hook_input: OpenCodeHookInput = serde_json::from_str(hook_input)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        let is_bash = hook_input
+        let tool_class = hook_input
             .tool_name
             .as_deref()
-            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name) == ToolClass::Bash)
-            .unwrap_or(false);
+            .map(|name| bash_tool::classify_tool(Agent::OpenCode, name))
+            .unwrap_or(ToolClass::FileEdit);
+        if tool_class == ToolClass::Skip {
+            return Ok(vec![]);
+        }
+        let is_bash = tool_class == ToolClass::Bash;
 
         let is_pre = hook_input.hook_event_name == "PreToolUse";
 
@@ -274,39 +164,12 @@ impl AgentPreset for OpenCodePreset {
             .map(ToString::to_string);
         let tool_use_id_str = tool_use_id.as_deref().unwrap_or("bash").to_string();
 
-        // Build metadata
-        let mut metadata = HashMap::new();
-        metadata.insert("session_id".to_string(), session_id.clone());
-        if let Ok(test_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
-            metadata.insert("__test_storage_path".to_string(), test_path);
-        }
-
-        // Resolve transcript source
-        let transcript_result = Self::resolve_stream_source(&session_id);
-
-        let extracted_model = transcript_result.as_ref().and_then(|(ts, _)| {
-            crate::streams::model_extraction::extract_model(
-                &ts.path,
-                crate::streams::sweep::StreamFormat::OpenCodeSqlite,
-                Some(session_id.as_str()),
-            )
-            .ok()
-            .flatten()
-        });
-
         let context = PresetContext {
-            agent_id: AgentId {
-                tool: "opencode".to_string(),
-                id: session_id.clone(),
-                model: extracted_model.unwrap_or_else(|| "unknown".to_string()),
-            },
+            agent: "opencode".to_string(),
             external_session_id: session_id,
             trace_id: trace_id.to_string(),
             cwd: PathBuf::from(&cwd),
-            metadata,
         };
-
-        let stream_source = transcript_result.map(|(source, _)| source);
 
         let event = match (is_pre, is_bash) {
             (true, true) => ParsedHookEvent::PreBashCall(PreBashCall {
@@ -317,205 +180,20 @@ impl AgentPreset for OpenCodePreset {
             (true, false) => ParsedHookEvent::PreFileEdit(PreFileEdit {
                 context,
                 file_paths,
-                dirty_files: None,
                 tool_use_id: Some(tool_use_id_str),
             }),
             (false, true) => ParsedHookEvent::PostBashCall(PostBashCall {
                 context,
                 tool_use_id: tool_use_id_str,
                 command: bash_command,
-                stream_source,
             }),
             (false, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
                 context,
                 file_paths,
-                dirty_files: None,
-                stream_source,
                 tool_use_id: Some(tool_use_id_str),
             }),
         };
 
         Ok(vec![event])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::checkpoint_agent::presets::*;
-    use serde_json::json;
-
-    fn make_opencode_input(event: &str, tool: &str) -> String {
-        json!({
-            "hook_event_name": event,
-            "session_id": "oc-sess-123",
-            "cwd": "/home/user/project",
-            "tool_name": tool,
-            "tool_use_id": "tu-1",
-            "tool_input": {"file_path": "src/main.rs"}
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn test_opencode_pre_file_edit() {
-        let input = make_opencode_input("PreToolUse", "edit");
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PreFileEdit(e) => {
-                assert_eq!(e.context.agent_id.tool, "opencode");
-                assert_eq!(e.context.external_session_id, "oc-sess-123");
-                assert_eq!(e.context.cwd, PathBuf::from("/home/user/project"));
-                assert!(!e.file_paths.is_empty());
-                assert_eq!(
-                    e.context.metadata.get("session_id").map(String::as_str),
-                    Some("oc-sess-123")
-                );
-            }
-            _ => panic!("Expected PreFileEdit"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_post_file_edit() {
-        let input = make_opencode_input("PostToolUse", "write");
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(e.context.agent_id.tool, "opencode");
-                // Transcript source depends on whether the storage path exists
-            }
-            _ => panic!("Expected PostFileEdit"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_pre_bash_call() {
-        let input = make_opencode_input("PreToolUse", "bash");
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PreBashCall(e) => {
-                assert_eq!(e.context.agent_id.tool, "opencode");
-                assert_eq!(e.tool_use_id, "tu-1");
-            }
-            _ => panic!("Expected PreBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_post_bash_call() {
-        let input = make_opencode_input("PostToolUse", "shell");
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                assert_eq!(e.context.agent_id.tool, "opencode");
-                assert_eq!(e.tool_use_id, "tu-1");
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_extracts_file_paths_from_tool_input() {
-        let input = json!({
-            "hook_event_name": "PostToolUse",
-            "session_id": "sess-1",
-            "cwd": "/project",
-            "tool_name": "edit",
-            "tool_input": {
-                "file_path": "src/main.rs",
-                "fspath": "/project/src/lib.rs"
-            }
-        })
-        .to_string();
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostFileEdit(e) => {
-                assert!(!e.file_paths.is_empty());
-            }
-            _ => panic!("Expected PostFileEdit"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_normalize_hook_path_absolute() {
-        assert_eq!(
-            OpenCodePreset::normalize_hook_path("/home/user/file.rs", "/project"),
-            Some("/home/user/file.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_opencode_normalize_hook_path_relative() {
-        assert_eq!(
-            OpenCodePreset::normalize_hook_path("src/main.rs", "/project"),
-            Some("/project/src/main.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_opencode_normalize_hook_path_file_uri() {
-        assert_eq!(
-            OpenCodePreset::normalize_hook_path("file:///home/user/file.rs", "/project"),
-            Some("/home/user/file.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn test_opencode_normalize_hook_path_empty() {
-        assert_eq!(OpenCodePreset::normalize_hook_path("", "/project"), None);
-    }
-
-    #[test]
-    fn test_opencode_collect_apply_patch_paths() {
-        let mut out = Vec::new();
-        super::super::parse::collect_apply_patch_paths_from_text(
-            "*** Update File: src/main.rs\n*** Add File: src/new.rs",
-            &mut out,
-        );
-        assert_eq!(out, vec!["src/main.rs", "src/new.rs"]);
-    }
-
-    #[test]
-    fn test_opencode_extracts_file_paths_from_patch_key() {
-        let input = json!({
-            "hook_event_name": "PostToolUse",
-            "session_id": "sess-1",
-            "cwd": "/project",
-            "tool_name": "edit",
-            "tool_input": {
-                "patch": "*** Update File: /project/src/main.rs\n@@ old\n+new\n"
-            }
-        })
-        .to_string();
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(e.file_paths, vec![PathBuf::from("/project/src/main.rs")]);
-            }
-            _ => panic!("Expected PostFileEdit"),
-        }
-    }
-
-    #[test]
-    fn test_opencode_default_tool_use_id() {
-        let input = json!({
-            "hook_event_name": "PreToolUse",
-            "session_id": "sess-1",
-            "cwd": "/project",
-            "tool_name": "bash"
-        })
-        .to_string();
-        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PreBashCall(e) => {
-                assert_eq!(e.tool_use_id, "bash");
-            }
-            _ => panic!("Expected PreBashCall"),
-        }
     }
 }

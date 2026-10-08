@@ -196,7 +196,8 @@ mod tests {
         assert!(content.contains("filesModifiedByToolCall"));
         assert!(content.contains("spawn("));
         assert!(content.contains("'--hook-input', 'stdin'"));
-        assert!(content.contains("rev-parse"));
+        assert!(!content.contains("rev-parse"));
+        assert!(content.contains("event.thread?.id"));
         assert!(content.contains("__GIT_AI_BINARY_PATH__"));
     }
 

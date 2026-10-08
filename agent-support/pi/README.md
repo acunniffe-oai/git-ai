@@ -4,7 +4,7 @@
 
 - `~/.pi/agent/extensions/git-ai.ts`
 
-That extension emits canonical Pi `before_edit` / `after_edit` checkpoint payloads and runs:
+The extension emits an `after_edit` checkpoint after a successful file edit, and `before_command` / `after_command` checkpoints for shell calls. It uses Pi’s native session ID and records paths without reading edited files or transcripts. It runs:
 
 ```bash
 git-ai checkpoint pi --hook-input stdin
@@ -53,6 +53,8 @@ Without an override file, the managed Pi extension only treats these as mutating
 - `edit` -> canonical `edit`, filepath field `path`
 - `write` -> canonical `write`, filepath field `path`
 
+The built-in `bash` tool also sends pre/post shell signals. Failed shell calls still send their post signal because they may have written files before failing.
+
 ## Example: add Serena mutators
 
 ```json
@@ -96,14 +98,12 @@ Check generated extension:
 grep -n "checkpoint', 'pi'\|git-ai.override.json" ~/.pi/agent/extensions/git-ai.ts
 ```
 
-Check tracked checkpoints in a repo:
+Check the daemon and local session-link pipeline:
 
 ```bash
-cat .git/ai/working_logs/*/checkpoints.jsonl
+git-ai daemon status
+git-ai debug
+git-ai await
 ```
 
-Check authored note on the latest commit:
-
-```bash
-git notes --ref=ai show HEAD
-```
+Git AI v2 stores repository-level session/commit links in `~/.git-ai/internal/otel-db`. It does not create working logs or Git Notes, and the adapter does not read local transcripts.

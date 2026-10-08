@@ -51,162 +51,31 @@ When opening a PR, make sure to monitor the ubuntu-based CI jobs first. They are
 
 ## Architecture
 
-### Binary dispatch (src/main.rs)
+Git AI v2 links native agent sessions to local commits and exports `git_ai.session.linked_commit` through OTEL. There is no line attribution, Git Note storage, human-edit detection, IDE extension, local transcript processing, or token/usage pipeline.
 
-A single binary serves two roles based on `argv[0]`:
-- **`argv[0] == "git"`** --> `commands::git_handlers::handle_git()` -- proxies to real git with pre/post hooks per subcommand
-- **`argv[0] == "git-ai"`** --> `commands::git_ai_handlers::handle_git_ai()` -- direct subcommands (checkpoint, blame, diff, status, search, etc.)
-- **Debug-only shortcut**: When `cfg!(debug_assertions)` and `GIT_AI=git` env var is set, forces git proxy mode regardless of binary name. Most integration tests no longer rely on this: they run the real git binary with trace2 wired to a per-test daemon (production-like), using the proxy env only in a few special cases.
+### Checkpoints and local links
 
-### Core data flow: checkpoint --> working log --> authorship note
+Native hooks parse the original agent/session ID and confirm a write. Post-file hooks carry repository-level evidence without file contents. Shell hooks compare bounded filesystem metadata until the session is attached; subsequent calls in that commit window skip the scan. Shell invocation correlation allows post-hooks to link commits made inside a writing tool call.
 
-1. **Checkpoint**: An AI coding agent calls `git-ai checkpoint <agent>` with hook input (typically JSON via stdin) before AND after it edits a file. The corresponding agent preset (`src/commands/checkpoint_agent/agent_presets.rs`) extracts edited file paths, transcript, and model info. The checkpoint processor diffs the file against HEAD's version or the last-checkpointed value of that file and compute character-level attributions. The combination of pre and post file edit checkpoints is what allows us to know exactly what the AI changed (since we can compare the before and after). There are 3 main types of checkpoints in git-ai:
-    * Plain or legacy `human`: only due to legacy, it's still called `human` as it used to mean "human" edited files, but since we migrated to an explicit Human checkpoint (now called `known_human`), this checkpoint represents 'untracked' changes. This is the checkpoint that AI agent presets invoke to take the before edit snapshots. Changes caught by these checkpoints do get explicit attestations in the final authorship notes (they are basically holes in the data) and stats recognize them as untracked. For testing, invoke by calling `git-ai checkpoint human` (for unscoped) or `git-ai checkpoint human /path/to/file` (for scoped).
-    * Known human (`known_human`) checkpoints: this is the 'real' Human checkpoint. These are never called by the AI agent presets and are only invoked by our IDE/editor extensions that recognize when a change has actually been made by the human by typing, etc. For testing, invoke via `git-ai checkpoint mock_known_human` (for unscoped) or `git-ai checkpoint mock_known_human /path/to/file` (for scoped).
-    * AI checkpoint (`ai_agent`) checkpoints: this is the AI checkpoint that explicitly associates the captured changes with the particular AI agent and session. This is the checkpoint taht AI agent presets invoke to take the after edit snapshots. For testing, invoke via `git-ai checkpoint mock_ai` (for unscoped) or `git-ai checkpoint mock_ai /path/to/file` (for scoped).
+`src/commit_links/store.rs` persists pending session sets per repository family/worktree/window and committed session links in SQLite alongside the existing OTEL outbox. A commit consumes pending sessions transactionally with its links and delivery work. Replays are idempotent. Partial staging or reverting an edit does not retract the repository-level signal.
 
-2. **Working log**: Checkpoint data is written to `.git/ai/working_logs/<base_commit>/` as JSON files. Each working log entry records per-file line attributions (which ranges are AI vs known human vs untracked (legacy human)) and session metadata.
+### Trace2 processing
 
-3. **Post-commit authorship**: After `git commit`, the daemon reads working logs, generates an `AuthorshipLog` (schema version `authorship/3.0.0`), and stores it as a Git Note under `refs/notes/ai`. The authorship log contains attestation entries (hash --> line ranges) and a metadata section with prompt records.
+Keep trace ingestion minimal. `TraceNormalizer`, family actors, and `RefCursor` establish ordered immutable transitions. Only downstream workers apply commit/rewrite effects. `src/commit_links/rewrite.rs` copies or unions session sets across captured commit sequences; stash and reset operate on sets, never file contents. Do not substitute processing-time HEAD for historical operation state.
 
-4. **Rewrite tracking**: The daemon ingests git trace2 event streams to learn which git commands ran, establishes exact ref transitions via a reflog cursor model (`src/daemon/ref_cursor.rs`), and migrates authorship notes/working logs through `src/authorship/rewrite.rs` (`RewriteEvent` + `handle_rewrite_event`) plus the per-operation modules (`rewrite_reset.rs`, `rewrite_stash.rs`, `rewrite_revert.rs`, `rewrite_cherry_pick.rs`). See `docs/rewrite-ops-spec.md` and `docs/daemon-trace2-ingestion-spec.md`.
+OTEL enrichment uses a fixed number of batched Git calls. Delivery retains existing endpoint/authentication, payload, retry, deduplication, and `await` behavior. No remote notes or historical attribution import is involved.
 
-### Daemon trace2 ingestion (src/daemon.rs, src/daemon/)
+### Commands and configuration
 
-The git proxy is a thin passthrough (`src/commands/git_handlers.rs`); all attribution side effects run in the shared daemon, driven by trace2:
-
-- Socket listener receives trace2 JSON frames; definitely-read-only roots are filtered out
-- `TraceNormalizer` (src/daemon/trace_normalizer.rs) groups frames by root sid into a `NormalizedCommand`
-- A per-repo-family actor (src/daemon/family_actor.rs) sequences commands and checkpoints in order
-- `RefCursor::enrich_command` (src/daemon/ref_cursor.rs) consumes cursor-bounded reflog entries to fill exact `ref_changes`; commands without a cursor or immutable argv OIDs fail closed for attribution
-- Analyzers (src/daemon/analyzers/history.rs) classify enriched commands into semantic events that drive post-commit authorship and rewrite-note migration
-
-Signal forwarding: On Unix, the git proxy installs signal handlers (SIGTERM, SIGINT, SIGHUP, SIGQUIT) that forward to the child git process group.
-
-### Config singleton
-
-`Config` is a global `OnceLock` singleton accessed via `Config::get()`. It reads from `~/.git-ai/config.json`. In tests, `GIT_AI_TEST_CONFIG_PATCH` env var allows overriding specific config fields without a real config file. Feature flags follow precedence: environment vars (`GIT_AI_*` prefix via `envy`) > config file > defaults.
-
-Feature flags have separate debug/release defaults defined via the `define_feature_flags!` macro in `src/feature_flags.rs`. Currently: `auth_keyring` (false/false), `transcript_streaming` (true/true), `transcript_sweep` (true/true), `checkpoint_debug_log` (false/false), `daemon_log_upload` (true/true), `token_usage_metrics` (true/true), `untraced_commit_fixup` (true/true), `untraced_fixup_ignore_temp_repos` (true/true).
-
-### Error handling
-
-`GitAiError` enum in `src/error.rs` -- not `thiserror`-based, uses manual `Display`/`From` impls. Variants: `GitCliError` (captures exit code + stderr + args), `IoError`, `JsonError`, `SqliteError`, `PresetError`, `Generic`, `GixError`.
+Retain checkpoint, daemon, install/uninstall, configuration, upgrade, diagnostics, authentication/bootstrap, and await commands. Legacy `git` invocation compatibility is a transparent passthrough with signal forwarding; it performs no pre/post attribution work. Configuration precedence remains environment > config file > defaults.
 
 ## Test Infrastructure
 
-### Integration test framework (tests/integration/repos/)
+Use `TestRepo` to run real Git with trace2 connected to isolated test daemons. Follow strict TDD: write and run a failing behavioral test before implementing each change. Explicitly write files and invoke native hook payloads; do not synthesize hidden human checkpoints.
 
-Tests create real git repositories and run against a shared test daemon pool (trace2-driven, like production). The test framework has three key files:
+After every commit, assert the exact local session-link set with `repo.assert_commit_links(&sha, &[(agent, session_id)])`, including the empty set. Assert committed file content where relevant. `TestFile` is a content/staging helper only. OTEL tests must also check the actual collector payload and retries.
 
-- **`tests/integration/repos/test_repo.rs`** -- `TestRepo` struct: creates temp git repos, runs git/git-ai commands as subprocesses wired to a per-test daemon (control + trace sockets), and provides explicit daemon sync before assertions. Uses `get_binary_path()` which auto-compiles the binary via a `OnceLock`.
-
-- **`tests/integration/repos/test_file.rs`** -- `TestFile` fluent API for setting file contents with attribution expectations. The `lines!` macro + `.ai()` / `.human()` / `.unattributed_human()` trait methods create `ExpectedLine` vectors. `assert_lines_and_blame()` validates both content and AI/human attribution.
-
-- **`tests/integration/repos/mod.rs`** -- `subdir_test_variants!` macro auto-generates two test variants: one from a subdirectory and one using `-C` flag, to verify repository discovery works from any CWD.
-
-Simple test pattern (using all standard helpers):
-```rust
-#[test]
-fn test_using_test_repo() {
-    let repo = TestRepo::new();
-    let mut file = repo.filename("test.txt");
-    file.set_contents(lines!["Line 1", "AI line".ai()]);
-    repo.stage_all_and_commit("Initial commit").unwrap();
-    file.assert_lines_and_blame(lines!["Line 1".human(), "AI line".ai()]);
-}
-```
-
-For certain test cases, especially where you are focused on testing specific checkpoint or attribution behavior, do NOT use the `file.set_contents` helper as it has a very specific (and unrealistic) ai vs human checkpointing flow that first sets file content to all the human values with explicit placeholders for the lines that are AI, calls a known human checkpoint, and then replaces the AI lines with their real values and calls the AI checkpoint after. As you can imagine, if you really want to test nuances of checkpointing, this is problematic. In those cases, explicitly write the file using standard Rust file write utils and explicitly call the ai vs human checkpoints mocking the real pre/post checkpointing flow using `mock_known_human` for explicit/known human changes, `human` for untracked changes, and `mock_ai` for AI changes. Example with custom writes+checkpointing for when you really care about exact replication of issues or testing checkpointing/attribution internals or any time the exact flow, order, etc. of checkpoints is relevant:
-
-```rust
-#[test]
-fn test_using_test_repo_with_custom_checkpoints() {
-    let repo = TestRepo::new();
-    let file_path = repo.path().join("example.md");
-
-    let initial = "\
-Untracked line
-";
-    fs::write(&file_path, initial).unwrap();
-    // Example of a completely untracked edit where we didn't fire a checkpoint call at all
-    repo.stage_all_and_commit("Initial commit").unwrap();
-    // Assert after every commit
-    let mut file = repo.filename("example.md");
-    // ALWAYS use the helper to assert the lines post-commit AND make sure to always assert line-level after EVERY commit for EVERY test you EVER right. This is CRUCIAL.
-    file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
-    ]);
-
-
-    let second_edit = "\
-Untracked line
-Human line
-";
-    fs::write(&file_path, second_edit).unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "example.md"])
-        .unwrap();
-
-    // Explicit add call (very useful to test partial staging scenarios)
-    repo.git(&["add", "."]).unwrap();
-    // Explicit commit
-    repo.commit("Second commit").unwrap();
-    file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // still 'untracked'
-        "Human line".human(), // known human
-    ]);
-
-    let third_edit = "\
-Untracked line
-Human line
-AI line
-";
-    fs::write(&file_path, third_edit).unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "example.md"])
-        .unwrap();
-    // Example of a completely untracked edit where we didn't fire a checkpoint call at all
-    repo.stage_all_and_commit("Third commit").unwrap();
-    file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
-        "Human line".human(), // known human
-        "AI line".ai(), // AI line
-    ]);
-
-    let fourth_edit = "\
-Untracked line
-Human line
-AI line
-Another untracked line
-";
-    fs::write(&file_path, fourth_edit).unwrap();
-    // Mocking an AI agent preset's pre edit checkpoint, which all the AI agent presets do to exclude
-    // changes made by something else (impossible to know what) before the AI makes its own edit. We mock
-    // that by calling a 'legacy human' (untracked) checkpoint.
-    repo.git_ai(&["checkpoint", "human", "example.md"])
-        .unwrap();
-    
-    let fifth_edit = "\
-Untracked line
-Human line
-AI line
-Another untracked line
-Another AI line
-";
-    fs::write(&file_path, fifth_edit).unwrap();
-    // Mocking an AI agent preset's post edit checkpoint, which all the AI agent presets do to capture the changes made by the AI.
-    // We mock that by calling a 'mock_ai' checkpoint.
-    repo.git_ai(&["checkpoint", "mock_ai", "example.md"])
-        .unwrap();
-    repo.stage_all_and_commit("Fourth commit").unwrap();
-    file.assert_committed_lines(lines![
-        "Untracked line".unattributed_human(), // 'untracked'
-        "Human line".human(), // known human
-        "AI line".ai(), // AI line
-        "Another untracked line".unattributed_human(), // 'untracked'
-        "Another AI line".ai(), // AI line
-    ]);
-}
-```
+Preserve transport, causal ordering, restart, worktree isolation, subdirectory/-C, and cross-platform coverage. Instrument total Git spawns for whole operations so counts stay fixed when commit/file counts increase. Warm checkpoint tests must show no content reads or scans.
 
 ### Test isolation
 
@@ -226,7 +95,7 @@ Uses `insta` crate. Snapshots live in `tests/integration/snapshots/` and `tests/
 - **`debug_log()`** for conditional debug output: prints `[git-ai]` prefixed messages to stderr when `cfg!(debug_assertions)` or `GIT_AI_DEBUG=1`. Set `GIT_AI_DEBUG=0` to suppress in debug builds.
 - **`GIT_AI_DEBUG_PERFORMANCE=1`** (or `=2` for JSON) enables performance timing output.
 - **Paths are POSIX-normalized**: `normalize_to_posix()` utility converts Windows backslashes. File paths in authorship logs and working logs always use forward slashes.
-- **`GIT_AI_VERSION` constant** changes between debug/release/test modes via `cfg` attributes in `authorship_log_serialization.rs`.
+- **`GIT_AI_VERSION` constant** changes between debug/release/test modes via `cfg` attributes in `version.rs`.
 - **Cross-platform**: `#[cfg(unix)]` / `#[cfg(windows)]` conditional compilation is used extensively (well over a hundred `#[cfg(windows)]` annotations across ~two dozen files) for signal handling, process creation flags (`CREATE_NO_WINDOW`), path handling, terminal detection, and named-pipe vs unix-socket transport (e.g. the daemon control/trace sockets are named pipes on Windows, so `Path::exists()` checks are gated to non-Windows).
 
 ## Optimize for Human Review
@@ -243,6 +112,6 @@ Uses `insta` crate. Snapshots live in `tests/integration/snapshots/` and `tests/
 
 - **Feature flag debug/release divergence**: Some flags have different debug/release defaults (see `define_feature_flags!` macro). Tests run debug builds, so a test passing in debug may behave differently in release if it depends on a flag that diverges.
 
-- **Working log base commit**: Working logs are keyed by the HEAD commit at checkpoint time (`.git/ai/working_logs/<sha>/`). Git AI must ensure that HEAD changes update/copy over the working log accordingly.
+- **Repository identity**: Canonicalize repository-family and worktree keys consistently; symlink spellings must not create separate pending sets. Commit-window changes are sequenced with trace2 operations.
 
 - **Large source files**: Several core files exceed 5-10k lines. Navigate with grep, not scrolling.

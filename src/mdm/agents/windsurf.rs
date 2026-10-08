@@ -1,10 +1,7 @@
 use crate::error::GitAiError;
-use crate::mdm::hook_installer::{
-    HookCheckResult, HookInstaller, HookInstallerParams, InstallResult, UninstallResult,
-};
+use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    generate_diff, home_dir, install_vsc_editor_extension, is_git_ai_checkpoint_command,
-    is_github_codespaces, is_vsc_editor_extension_installed, resolve_editor_cli, write_atomic,
+    generate_diff, home_dir, is_git_ai_checkpoint_command, resolve_editor_cli, write_atomic,
 };
 
 use serde_json::{Value, json};
@@ -19,7 +16,6 @@ const HOOK_EVENTS: &[&str] = &[
     "post_write_code",
     "pre_run_command",
     "post_run_command",
-    "post_cascade_response_with_transcript",
 ];
 
 pub struct WindsurfInstaller;
@@ -43,7 +39,7 @@ impl WindsurfInstaller {
         desired_cmd: &str,
         dry_run: bool,
     ) -> Result<Option<String>, GitAiError> {
-        if let Some(dir) = hooks_path.parent() {
+        if !dry_run && let Some(dir) = hooks_path.parent() {
             fs::create_dir_all(dir)?;
         }
 
@@ -61,6 +57,20 @@ impl WindsurfInstaller {
 
         let mut merged = existing.clone();
         let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
+
+        // This hook only supplied local transcripts in v1. Preserve hooks
+        // owned by other tools while retiring our obsolete registration.
+        if let Some(hooks) = hooks_obj
+            .get_mut("post_cascade_response_with_transcript")
+            .and_then(Value::as_array_mut)
+        {
+            hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_git_ai_checkpoint_command)
+            });
+        }
 
         for event in HOOK_EVENTS {
             let mut event_array = hooks_obj
@@ -233,6 +243,19 @@ impl HookInstaller for WindsurfInstaller {
 
             let content = fs::read_to_string(&hooks_path)?;
             let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+            let has_retired_hook = existing
+                .pointer("/hooks/post_cascade_response_with_transcript")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(is_git_ai_checkpoint_command)
+                    })
+                });
+            if has_retired_hook {
+                all_installed = false;
+            }
 
             let has_hooks = HOOK_EVENTS.iter().all(|event| {
                 existing
@@ -308,125 +331,5 @@ impl HookInstaller for WindsurfInstaller {
         } else {
             Ok(Some(all_diffs.join("\n")))
         }
-    }
-
-    fn install_extras(
-        &self,
-        _params: &HookInstallerParams,
-        dry_run: bool,
-    ) -> Result<Vec<InstallResult>, GitAiError> {
-        let mut results = Vec::new();
-
-        // Skip extension installation in GitHub Codespaces
-        // Extensions must be configured via devcontainer.json in Codespaces
-        if is_github_codespaces() {
-            results.push(InstallResult {
-                changed: false,
-                diff: None,
-                message: "Windsurf: Unable to install extension in GitHub Codespaces. Add to your devcontainer.json: \"customizations\": { \"vscode\": { \"extensions\": [\"git-ai.git-ai-vscode\"] } }".to_string(),
-            });
-            return Ok(results);
-        }
-
-        // Install VS Code extension
-        if let Some(cli) = resolve_editor_cli("windsurf") {
-            match is_vsc_editor_extension_installed(&cli, "git-ai.git-ai-vscode") {
-                Ok(true) => {
-                    results.push(InstallResult {
-                        changed: false,
-                        diff: None,
-                        message: "Windsurf: Extension already installed".to_string(),
-                    });
-                }
-                Ok(false) => {
-                    if dry_run {
-                        results.push(InstallResult {
-                            changed: true,
-                            diff: None,
-                            message: "Windsurf: Pending extension install".to_string(),
-                        });
-                    } else {
-                        println!("Installing extensions...");
-                        println!("\tInstalling extension 'git-ai.git-ai-vscode'...");
-                        match install_vsc_editor_extension(&cli, "git-ai.git-ai-vscode") {
-                            Ok(()) => {
-                                results.push(InstallResult {
-                                    changed: true,
-                                    diff: None,
-                                    message: "\tExtension 'git-ai.git-ai-vscode' was successfully installed.".to_string(),
-                                });
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Windsurf: Error automatically installing extension: {}",
-                                    e
-                                );
-                                results.push(InstallResult {
-                                    changed: false,
-                                    diff: None,
-                                    message: "Windsurf: Unable to automatically install extension. Please cmd+click on the following link to install: windsurf:extension/git-ai.git-ai-vscode (or search for 'git-ai-vscode' in the Windsurf extensions tab)".to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    results.push(InstallResult {
-                        changed: false,
-                        diff: None,
-                        message: format!("Windsurf: Failed to check extension: {}", e),
-                    });
-                }
-            }
-        } else {
-            // resolve_editor_cli returned None -- the only way to reach this
-            // branch. Windsurf was detected only from its config dotfiles
-            // (~/.codeium) and isn't actually installed, so there's nothing to
-            // install the extension into. Don't emit a misleading "unable to
-            // install" nag here; genuine install/check failures are already
-            // reported by the match arms above.
-        }
-
-        Ok(results)
-    }
-
-    fn uninstall_extras(
-        &self,
-        _params: &HookInstallerParams,
-        _dry_run: bool,
-    ) -> Result<Vec<UninstallResult>, GitAiError> {
-        Ok(vec![UninstallResult {
-            changed: false,
-            diff: None,
-            message: "Windsurf: Extension must be uninstalled manually through the editor"
-                .to_string(),
-        }])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_install_extras_does_not_nag_when_cli_absent() {
-        // Regression: when the Windsurf app/CLI isn't resolvable (e.g. only the
-        // ~/.codeium dotfiles exist), install_extras must not emit the misleading
-        // "Unable to automatically install extension" message. dry_run=true means
-        // a real install is never attempted, so this never spawns an editor.
-        let params = HookInstallerParams {
-            binary_path: std::path::PathBuf::from("/usr/local/bin/git-ai"),
-        };
-        let results = WindsurfInstaller.install_extras(&params, true).unwrap();
-        assert!(
-            results
-                .iter()
-                .all(|r| !r.message.contains("Unable to automatically install")),
-            "unexpected extension nag: {:?}",
-            results
-                .iter()
-                .map(|r| r.message.clone())
-                .collect::<Vec<_>>()
-        );
     }
 }

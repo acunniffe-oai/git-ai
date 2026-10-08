@@ -103,10 +103,9 @@ case "$AGENT" in
 esac
 
 # ── Ensure changes are committed ──────────────────────────────────────────────
-# The post-commit hook writes the authorship note, so we need a commit.
-# If the agent wrote code but didn't commit, do a fallback commit — the
-# pre/post-tool-use hooks still fired during the agent run, so working log
-# data is present and the post-commit hook will still produce a note.
+# Trace2 links pending native session signals when a commit is created.
+# If the agent wrote code without committing, commit that work so the local
+# SQLite link can be verified by the smoke check.
 COMMITS_AFTER=$(git rev-list HEAD --count)
 
 if [ "$COMMITS_AFTER" -gt "$COMMITS_BEFORE" ]; then

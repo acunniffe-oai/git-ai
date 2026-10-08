@@ -4,9 +4,7 @@
 //! which handle installation of git hooks for various IDEs and coding agents.
 
 use crate::repos::test_repo::{DaemonTestScope, TestRepo, get_binary_path};
-use git_ai::commands::install_hooks::{
-    InstallResult, InstallStatus, run, run_uninstall, to_hashmap,
-};
+use git_ai::commands::install_hooks::{InstallResult, InstallStatus, to_hashmap};
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
@@ -118,44 +116,44 @@ fn test_install_result_with_multiple_warnings() {
 }
 
 #[test]
-fn test_install_result_message_for_metrics_with_error() {
+fn test_install_result_message_for_diagnostics_with_error() {
     let result = InstallResult::failed("Critical error");
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert_eq!(message, Some("Critical error".to_string()));
 }
 
 #[test]
-fn test_install_result_message_for_metrics_with_warnings() {
+fn test_install_result_message_for_diagnostics_with_warnings() {
     let result = InstallResult::installed()
         .with_warning("Warning 1")
         .with_warning("Warning 2");
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert_eq!(message, Some("Warning 1; Warning 2".to_string()));
 }
 
 #[test]
-fn test_install_result_message_for_metrics_with_error_and_warnings() {
+fn test_install_result_message_for_diagnostics_with_error_and_warnings() {
     // Error takes precedence over warnings
     let result = InstallResult::failed("Error message").with_warning("Some warning");
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert_eq!(message, Some("Error message".to_string()));
 }
 
 #[test]
-fn test_install_result_message_for_metrics_no_error_or_warnings() {
+fn test_install_result_message_for_diagnostics_no_error_or_warnings() {
     let result = InstallResult::installed();
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert!(message.is_none());
 }
 
 #[test]
-fn test_install_result_message_for_metrics_empty_warnings() {
+fn test_install_result_message_for_diagnostics_empty_warnings() {
     let result = InstallResult {
         status: InstallStatus::Installed,
         error: None,
         warnings: vec![],
     };
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert!(message.is_none());
 }
 
@@ -427,146 +425,6 @@ fn install_hooks_detects_cline_from_vscode_server_extension_manifest() {
 }
 
 #[test]
-fn test_run_install_hooks_no_args() {
-    // This will try to run against the actual system, but should not crash
-    // It may fail if binary path cannot be determined, which is acceptable
-    let result = run(&[]);
-
-    // We just ensure it returns a result (success or error)
-    // The actual behavior depends on the system state
-    match result {
-        Ok(_statuses) => {
-            // Should return a HashMap, possibly empty
-            // Success is valid
-        }
-        Err(e) => {
-            // May fail if binary path is not available or other system issues
-            let err_msg = e.to_string();
-            // Just ensure we get a meaningful error
-            assert!(!err_msg.is_empty());
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_dry_run_flag() {
-    let args = vec!["--dry-run".to_string()];
-    let result = run(&args);
-
-    // Dry run should not modify anything
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(!err_msg.is_empty());
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_dry_run_true() {
-    let args = vec!["--dry-run=true".to_string()];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_verbose_flag() {
-    let args = vec!["--verbose".to_string()];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_verbose_short_flag() {
-    let args = vec!["-v".to_string()];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_multiple_flags() {
-    let args = vec!["--dry-run".to_string(), "--verbose".to_string()];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_with_dry_run_false() {
-    // Note: This could actually install hooks on the system
-    // In a real test environment, this should be run in isolation
-    let args = vec!["--dry-run=false".to_string()];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_install_hooks_ignores_unknown_args() {
-    // Unknown arguments should be ignored
-    let args = vec![
-        "--unknown-flag".to_string(),
-        "random-arg".to_string(),
-        "--dry-run".to_string(),
-    ];
-    let result = run(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-// ==============================================================================
-// Uninstall Tests
-// ==============================================================================
-
-#[test]
 fn test_uninstall_alias_runs_uninstall_hooks() {
     let repo = TestRepo::new();
     let output = repo
@@ -581,74 +439,6 @@ fn test_uninstall_alias_runs_uninstall_hooks() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-
-#[test]
-fn test_run_uninstall_hooks_no_args() {
-    let result = run_uninstall(&[]);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(!err_msg.is_empty());
-        }
-    }
-}
-
-#[test]
-fn test_run_uninstall_hooks_with_dry_run() {
-    let args = vec!["--dry-run".to_string()];
-    let result = run_uninstall(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_uninstall_hooks_with_verbose() {
-    let args = vec!["--verbose".to_string()];
-    let result = run_uninstall(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-#[test]
-fn test_run_uninstall_hooks_with_multiple_flags() {
-    let args = vec![
-        "--dry-run=true".to_string(),
-        "-v".to_string(),
-        "--unknown".to_string(),
-    ];
-    let result = run_uninstall(&args);
-
-    match result {
-        Ok(_statuses) => {
-            // Success is valid
-        }
-        Err(_e) => {
-            // May fail on CI or systems without binary path
-        }
-    }
-}
-
-// ==============================================================================
-// Edge Cases and Error Handling
-// ==============================================================================
 
 #[test]
 fn test_install_result_clone() {
@@ -726,20 +516,20 @@ fn test_install_result_failed_with_empty_string() {
 }
 
 #[test]
-fn test_install_result_message_for_metrics_single_warning() {
+fn test_install_result_message_for_diagnostics_single_warning() {
     let result = InstallResult::installed().with_warning("Only warning");
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert_eq!(message, Some("Only warning".to_string()));
 }
 
 #[test]
-fn test_install_result_message_for_metrics_warnings_join_with_semicolon() {
+fn test_install_result_message_for_diagnostics_warnings_join_with_semicolon() {
     let result = InstallResult::installed()
         .with_warning("First; warning")
         .with_warning("Second; warning")
         .with_warning("Third; warning");
 
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert_eq!(
         message,
         Some("First; warning; Second; warning; Third; warning".to_string())
@@ -748,55 +538,6 @@ fn test_install_result_message_for_metrics_warnings_join_with_semicolon() {
 
 // ==============================================================================
 // Integration-style Tests
-// ==============================================================================
-
-#[test]
-fn test_install_workflow_dry_run_does_not_modify_system() {
-    // Dry run should be safe to run repeatedly
-    let args = vec!["--dry-run".to_string(), "--verbose".to_string()];
-
-    let result1 = run(&args);
-    let result2 = run(&args);
-
-    // Both runs should succeed or fail consistently
-    match (result1, result2) {
-        (Ok(_statuses1), Ok(_statuses2)) => {
-            // Results may differ if system state changes between runs,
-            // but both should be valid HashMaps
-            // Success is valid
-        }
-        (Err(_), Err(_)) => {
-            // Both failing is acceptable (e.g., on CI without proper setup)
-        }
-        _ => {
-            // Inconsistent results would indicate a problem, but we allow it
-            // since the system state could change
-        }
-    }
-}
-
-#[test]
-fn test_uninstall_workflow_dry_run_does_not_modify_system() {
-    let args = vec!["--dry-run".to_string()];
-
-    let result1 = run_uninstall(&args);
-    let result2 = run_uninstall(&args);
-
-    match (result1, result2) {
-        (Ok(_statuses1), Ok(_statuses2)) => {
-            // Success is valid
-        }
-        (Err(_), Err(_)) => {
-            // Both failing is acceptable
-        }
-        _ => {
-            // Allow inconsistent results due to system state changes
-        }
-    }
-}
-
-// ==============================================================================
-// Status String Validation
 // ==============================================================================
 
 #[test]
@@ -872,7 +613,7 @@ fn test_install_result_builder_pattern() {
     assert_eq!(result.warnings.len(), 3);
     assert!(result.error.is_none());
 
-    let message = result.message_for_metrics();
+    let message = result.message_for_diagnostics();
     assert!(message.is_some());
     let msg = message.unwrap();
     assert!(msg.contains("Extension not found"));
@@ -918,7 +659,7 @@ fn test_install_result_different_error_types() {
         let result = InstallResult::failed(error);
         assert_eq!(result.status, InstallStatus::Failed);
         assert_eq!(result.error, Some(error.to_string()));
-        assert_eq!(result.message_for_metrics(), Some(error.to_string()));
+        assert_eq!(result.message_for_diagnostics(), Some(error.to_string()));
     }
 }
 

@@ -16,8 +16,6 @@ const LOG_INTERVAL_SECONDS: u64 = 5;
 struct AwaitResponse {
     done: bool,
     timed_out: bool,
-    metrics_remaining: usize,
-    notes_remaining: usize,
     #[serde(default)]
     otel_remaining: usize,
     #[serde(default)]
@@ -123,8 +121,8 @@ pub(crate) fn handle_await(args: &[String]) {
 
     if !data.done {
         eprintln!(
-            "await: background service could not finish ({} metrics, {} notes, {} OTLP remaining, including {} OTLP failures)",
-            data.metrics_remaining, data.notes_remaining, data.otel_remaining, data.otel_failed
+            "await: background service could not finish ({} OTLP remaining, including {} OTLP failures)",
+            data.otel_remaining, data.otel_failed
         );
         std::process::exit(1);
     }

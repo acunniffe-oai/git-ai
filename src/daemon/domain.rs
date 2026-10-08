@@ -56,6 +56,10 @@ pub struct NormalizedCommand {
     pub stash_target_oid: Option<String>,
     pub cherry_pick_source_oids: Vec<String>,
     pub revert_source_oids: Vec<String>,
+    /// A merge actually created by this command, proved by its cursor-bounded
+    /// reflog record. Existing merge objects reached by fast-forward omit it.
+    #[serde(default)]
+    pub merge_commit_oid: Option<String>,
     pub ref_changes: Vec<RefChange>,
     pub confidence: Confidence,
 }
@@ -237,21 +241,6 @@ pub struct WorktreeState {
     pub last_updated_ns: u128,
 }
 
-/// Watermarks used by the bash tool pre-hook to detect files that changed
-/// since the last checkpoint.
-///
-/// Two levels of granularity:
-/// - `per_file`: updated after every scoped checkpoint for the exact files it
-///   touched (normalized relative path → mtime_ns).
-/// - `per_worktree`: updated after a full (non-scoped) Human checkpoint;
-///   serves as a fallback for files with no per-file entry
-///   (normalized worktree path → timestamp_ns when last full snapshot ran).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WatermarkState {
-    pub per_file: HashMap<String, u128>,
-    pub per_worktree: HashMap<String, u128>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FamilyState {
     pub family_key: FamilyKey,
@@ -259,8 +248,6 @@ pub struct FamilyState {
     pub worktrees: HashMap<PathBuf, WorktreeState>,
     pub last_error: Option<String>,
     pub applied_seq: u64,
-    #[serde(default)]
-    pub watermarks: WatermarkState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

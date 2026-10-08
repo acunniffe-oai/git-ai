@@ -401,14 +401,13 @@ fn build_debug_report(options: DebugOptions) -> String {
 struct GitDebugDiagnostics {
     target: GitDiagnosticTarget,
     trace2_config: DiagnosticCheckResult,
-    attribution: DiagnosticCheckResult,
+    session_link: DiagnosticCheckResult,
     trace2: DiagnosticCheckResult,
 }
 
 struct GitCommitterIdentityInfo {
     global_config: Result<GitConfigIdentityResolution, String>,
     repository: RepositoryCommitterIdentity,
-    author_config: config::AuthorConfig,
 }
 
 enum RepositoryCommitterIdentity {
@@ -420,7 +419,6 @@ fn collect_git_committer_identity_info(
     repository_info: &RepositoryInfo,
 ) -> GitCommitterIdentityInfo {
     let global_config = global_git_config_identity_resolution().map_err(|e| e.to_string());
-    let author_config = config::Config::fresh_author_cached();
     let repository = repository_info
         .committer_identity
         .clone()
@@ -437,7 +435,6 @@ fn collect_git_committer_identity_info(
     GitCommitterIdentityInfo {
         global_config,
         repository,
-        author_config,
     }
 }
 
@@ -468,22 +465,6 @@ fn append_git_committer_identity(out: &mut String, identity: &GitCommitterIdenti
             let _ = writeln!(out, "  <not in repository: {}>", err);
         }
     }
-
-    let _ = writeln!(out, "Git AI author config override:");
-    append_author_config(out, &identity.author_config, "  ");
-
-    let _ = writeln!(out, "Git AI effective author identity:");
-    match &identity.repository {
-        RepositoryCommitterIdentity::InRepository(resolution) => {
-            let effective_author = resolution
-                .identity
-                .with_author_config(&identity.author_config);
-            append_git_author_identity(out, &effective_author, "  ");
-        }
-        RepositoryCommitterIdentity::NotInRepository(err) => {
-            let _ = writeln!(out, "  <not in repository: {}>", err);
-        }
-    }
 }
 
 fn append_raw_git_config_identity(
@@ -508,14 +489,6 @@ fn append_git_author_identity(out: &mut String, identity: &GitAuthorIdentity, pr
     let _ = writeln!(out, "{}Formatted: {}", prefix, formatted);
     let _ = writeln!(out, "{}Parsed name: {}", prefix, name);
     let _ = writeln!(out, "{}Parsed email: {}", prefix, email);
-}
-
-fn append_author_config(out: &mut String, author: &config::AuthorConfig, prefix: &str) {
-    let name = author.name.as_deref().unwrap_or("<unset>");
-    let email = author.email.as_deref().unwrap_or("<unset>");
-
-    let _ = writeln!(out, "{}author.name: {}", prefix, name);
-    let _ = writeln!(out, "{}author.email: {}", prefix, email);
 }
 
 fn collect_git_diagnostics(
@@ -551,14 +524,14 @@ fn collect_git_diagnostics(
             })
             .collect()
     };
-    let attributions: Vec<_> = targets
+    let session_links: Vec<_> = targets
         .iter()
         .map(|target| {
             let label = target.label.clone();
-            debug_progress(format!("starting attribution self-check for {}", label));
-            let result = crate::diagnostics::run_attribution_self_check(target);
+            debug_progress(format!("starting session-link self-check for {}", label));
+            let result = crate::diagnostics::run_session_link_self_check(target);
             debug_progress(format!(
-                "attribution self-check for {} {}",
+                "session-link self-check for {} {}",
                 label,
                 result.status.as_str()
             ));
@@ -597,13 +570,13 @@ fn collect_git_diagnostics(
     targets
         .into_iter()
         .zip(trace2_configs)
-        .zip(attributions)
+        .zip(session_links)
         .zip(trace2_checks)
         .map(
-            |(((target, trace2_config), attribution), trace2)| GitDebugDiagnostics {
+            |(((target, trace2_config), session_link), trace2)| GitDebugDiagnostics {
                 target,
                 trace2_config,
-                attribution,
+                session_link,
                 trace2,
             },
         )
@@ -634,8 +607,8 @@ fn append_git_diagnostics(
         append_diagnostic_check(out, "Trace2 config check", &diagnostic.trace2_config, false);
         append_diagnostic_check(
             out,
-            "Attribution self-check",
-            &diagnostic.attribution,
+            "Session-link self-check",
+            &diagnostic.session_link,
             false,
         );
         append_diagnostic_check(out, "Trace2 file self-check", &diagnostic.trace2, true);
@@ -1591,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_git_committer_identity_includes_effective_author() {
+    fn test_append_git_committer_identity_includes_raw_git_identity() {
         let identity = GitCommitterIdentityInfo {
             global_config: Ok(GitConfigIdentityResolution {
                 raw_name: Some("Git User".to_string()),
@@ -1608,21 +1581,17 @@ mod tests {
                     email: Some("git@example.com".to_string()),
                 },
             }),
-            author_config: config::AuthorConfig {
-                name: Some("Config User".to_string()),
-                email: None,
-            },
         };
 
         let mut out = String::new();
         append_git_committer_identity(&mut out, &identity);
 
-        assert!(out.contains("Git AI author config override:"), "{out}");
-        assert!(out.contains("  author.name: Config User"), "{out}");
-        assert!(out.contains("  author.email: <unset>"), "{out}");
-        assert!(out.contains("Git AI effective author identity:"), "{out}");
         assert!(
-            out.contains("  Formatted: Config User <git@example.com>"),
+            out.contains("Repository effective committer identity:"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  Formatted: Git User <git@example.com>"),
             "{out}"
         );
     }

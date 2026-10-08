@@ -1,54 +1,20 @@
-# git-ai Plugin for OpenCode
+# Git AI support for OpenCode
 
-A plugin that integrates [git-ai](https://github.com/git-ai-project/git-ai) with [OpenCode](https://opencode.ai) to automatically track AI-generated code.
+The managed OpenCode adapter links native OpenCode sessions to local commits. Install it with `git-ai install-hooks`. The installer supplies the absolute Git AI binary path.
 
-## Overview
+The adapter records edited paths and the original session ID when file tools finish. It supports `edit`, `write`, `patch`, `multiedit`, `apply_patch`, and `applypatch`. File pre-hooks keep only the information needed to match the result; they do not launch a checkpoint. Shell tools retain pre/post checkpoints so Git AI can detect a write and link commits made within the call.
 
-This plugin hooks into OpenCode's tool execution lifecycle to create checkpoints that mark code changes as either human or AI-authored. It uses the `tool.execute.before` and `tool.execute.after` events to:
+Repository discovery, pending-session deduplication, and trace2-driven commit processing run in Git AI. The adapter does not read edited file contents or local transcripts, and it does not spawn Git.
 
-1. Create a human checkpoint before AI edits (marking any intermediate changes as human-authored)
-2. Create an AI checkpoint after AI edits (marking the changes as AI-authored with model information)
-
-## Installation
-
-The plugin is automatically installed by `git-ai install-hooks`.
-
-Build `git-ai` (`cargo build`) and then run the `git-ai install-hooks` or `cargo run -- install-hooks` command to test the entire flow of installing and using the plugin.
-
-## Requirements
-
-- [git-ai](https://github.com/git-ai-project/git-ai) must be installed through `git-ai install-hooks`; the plugin uses the absolute binary path injected at install time
-- [OpenCode](https://opencode.ai) with plugin support
-
-## How It Works
-
-The plugin intercepts file editing operations (`edit`, `write`, `patch`, `multiedit`, and `apply_patch`) and:
-
-1. **Before AI edit**: Creates a human checkpoint to mark any changes since the last checkpoint as human-authored
-2. **After AI edit**: Creates an AI checkpoint with:
-   - Model information (provider/model ID)
-   - Session/conversation ID
-   - List of edited file paths
-
-If `git-ai` cannot be launched or the file is not in a git repository, the plugin gracefully skips checkpoint creation without breaking OpenCode functionality. Set `GIT_AI_OPENCODE_DEBUG=1` or `GIT_AI_DEBUG=1` before launching OpenCode to log skipped checkpoint details.
+If Git AI cannot be launched, the adapter lets OpenCode continue. Set `GIT_AI_OPENCODE_DEBUG=1` to inspect hook errors.
 
 ## Development
 
-### Type Checking
+Use `task dev` from the repository root to install a local debug build. To check the adapter's TypeScript types, run these commands in this directory:
 
-Run type checking:
 ```bash
+npm ci --ignore-scripts
 npm run type-check
 ```
 
-### Dependencies
-
-Install dependencies:
-```bash
-npm install
-```
-
-## See Also
-
-- [git-ai Documentation](https://github.com/git-ai-project/git-ai)
-- [OpenCode Plugin Documentation](https://opencode.ai/docs/plugins/)
+Runtime protocol regressions live in `tests/integration/v2_adapters.rs` and run through `task test`.

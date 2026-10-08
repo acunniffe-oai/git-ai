@@ -4,7 +4,7 @@ use git_ai::utils::{SuperuserCheckResult, check_superuser_guard, print_superuser
 
 #[derive(Parser)]
 #[command(name = "git-ai")]
-#[command(about = "git proxy with AI authorship tracking", long_about = None)]
+#[command(about = "Link agent sessions to Git commits", long_about = None)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 struct Cli {
     /// Git command and arguments

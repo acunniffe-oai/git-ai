@@ -1,52 +1,35 @@
 //! Commit/session links for the configured backend's OTLP collector.
-//! Note writers only collect successful writes. Git enrichment and HTTP delivery
+//! Transactional local links enqueue operation batches. Git enrichment and HTTP delivery
 //! run on a bounded OTLP runtime, independently of the regular telemetry flusher.
-mod db;
+pub(crate) mod db;
 mod worker;
 
-use crate::authorship::authorship_log_serialization::{AuthorshipLog, GIT_AI_VERSION};
-use crate::authorship::working_log::AgentId;
+use crate::commit_links::store::SessionIdentity;
 use crate::config::Config;
 use crate::error::GitAiError;
-use crate::git::repository::Repository;
-use futures::FutureExt;
+use crate::version::GIT_AI_VERSION;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) use worker::{flush_and_wait, spawn_worker};
 
 const EVENT: &str = "git_ai.session.linked_commit";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-struct Session {
-    agent: String,
-    id: String,
-}
+type Session = SessionIdentity;
 
 #[derive(Serialize, Deserialize)]
-struct Source {
-    git_dir: PathBuf,
-    repo_url: Option<String>,
-    time_unix_nano: String,
-    commits: BTreeMap<String, BTreeSet<Session>>,
+pub(crate) struct Source {
+    pub(crate) git_dir: PathBuf,
+    pub(crate) repo_url: Option<String>,
+    pub(crate) time_unix_nano: String,
+    #[serde(default)]
+    pub(crate) commit_times: BTreeMap<String, String>,
+    pub(crate) commits: BTreeMap<String, BTreeSet<Session>>,
 }
 
-struct Capture {
-    endpoint: String,
-    time_unix_nano: String,
-    repos: BTreeMap<PathBuf, (Repository, BTreeMap<String, BTreeSet<Session>>)>,
-}
-
-tokio::task_local! {
-    static CAPTURE: RefCell<Capture>;
-}
-
-fn endpoint(config: &Config) -> Option<String> {
+pub(crate) fn endpoint(config: &Config) -> Option<String> {
     // Test builds must explicitly opt into an isolated outbox; never send links
     // from unrelated fixtures using credentials inherited from the developer.
     #[cfg(any(test, feature = "test-support"))]
@@ -68,148 +51,8 @@ pub(crate) fn enabled() -> bool {
     endpoint(&Config::fresh()).is_some()
 }
 
-fn session(agent: &AgentId) -> Option<Session> {
-    let tool = match agent.tool.as_str() {
-        "claude" | "claude-code" => "claude-code",
-        "codex" => "codex",
-        "devin" => "devin",
-        "github-copilot" => "github-copilot",
-        "github-copilot-cli" => "github-copilot-cli",
-        _ => return None,
-    };
-    if agent.id.is_empty() || agent.id == "unknown" || agent.id.starts_with("DEVIN_SESSION") {
-        return None;
-    }
-    Some(Session {
-        agent: tool.into(),
-        id: agent.id.clone(),
-    })
-}
-
-impl Capture {
-    fn new(endpoint: String, time_ns: u128) -> Self {
-        Self {
-            endpoint,
-            time_unix_nano: time_ns.to_string(),
-            repos: BTreeMap::new(),
-        }
-    }
-
-    fn note(&mut self, repo: &Repository, sha: &str, content: &str) {
-        if !valid_hex(sha, &[40, 64]) {
-            return;
-        }
-        let Ok(note) = AuthorshipLog::deserialize_from_string(content) else {
-            return;
-        };
-        let sessions = note
-            .metadata
-            .prompts
-            .values()
-            .map(|r| &r.agent_id)
-            .chain(note.metadata.sessions.values().map(|r| &r.agent_id))
-            .filter_map(session)
-            .collect();
-        self.repos
-            .entry(repo.path().to_path_buf())
-            .or_insert_with(|| (repo.clone(), BTreeMap::new()))
-            .1
-            .insert(sha.into(), sessions);
-    }
-
-    fn persist(self) -> Result<(), GitAiError> {
-        let mut sources = Vec::new();
-        for (_, (repo, mut commits)) in self.repos {
-            commits.retain(|_, sessions| !sessions.is_empty());
-            if commits.is_empty() {
-                continue;
-            }
-            let repo_url = repo.get_default_remote().ok().flatten().and_then(|name| {
-                repo.remotes_with_urls()
-                    .ok()?
-                    .into_iter()
-                    .find(|(n, _)| n == &name)
-                    .map(|(_, url)| url)
-            });
-            sources.push(serde_json::to_string(&Source {
-                git_dir: repo.common_dir().to_path_buf(),
-                repo_url,
-                time_unix_nano: self.time_unix_nano.clone(),
-                commits,
-            })?);
-        }
-        if !sources.is_empty() {
-            db::Outbox::open()?.enqueue_sources(&self.endpoint, &sources)?;
-            worker::wake();
-        }
-        Ok(())
-    }
-}
-
-/// Scoped to the *side-effect* future, never the trace listener/normalizer.
-/// Task-local state survives awaits without leaking between repository actors.
-pub(crate) async fn capture_operation<T>(time_ns: u128, future: impl Future<Output = T>) -> T {
-    let Some(endpoint) = endpoint(&Config::fresh()) else {
-        return future.await;
-    };
-    CAPTURE
-        .scope(RefCell::new(Capture::new(endpoint, time_ns)), async move {
-            let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-            let capture = CAPTURE.with(|c| {
-                let mut capture = c.borrow_mut();
-                let replacement = Capture::new(String::new(), 0);
-                std::mem::replace(&mut *capture, replacement)
-            });
-            // Durable acceptance is part of asynchronous side-effect completion.
-            // Disk work uses the OTLP pool, not an ingestion runtime worker.
-            if !capture.repos.is_empty() {
-                let persisted = crate::tokio_runtime::otel_runtime()
-                    .spawn_blocking(move || capture.persist())
-                    .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(?persisted, "otel: could not persist note updates");
-                }
-            }
-            match result {
-                Ok(value) => value,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        })
-        .await
-}
-
-/// Called only after an authorship note has been successfully written.
-pub(crate) fn notes_updated<'a>(
-    repo: &Repository,
-    notes: impl IntoIterator<Item = (&'a str, &'a str)>,
-) {
-    let mut notes = notes.into_iter();
-    if CAPTURE
-        .try_with(|capture| {
-            for (sha, content) in notes.by_ref() {
-                capture.borrow_mut().note(repo, sha, content);
-            }
-        })
-        .is_ok()
-    {
-        return;
-    }
-    // Library/direct note writers have no trace command context. Their link is
-    // made now; persist it for the daemon's independent periodic worker.
-    let Some(endpoint) = endpoint(&Config::fresh()) else {
-        return;
-    };
-    let time_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut capture = Capture::new(endpoint, time_ns);
-    for (sha, content) in notes {
-        capture.note(repo, sha, content);
-    }
-    if let Err(error) = capture.persist() {
-        tracing::warn!(%error, "otel: could not persist note updates");
-    }
+pub(crate) fn wake() {
+    worker::wake();
 }
 
 fn valid_hex(value: &str, lengths: &[usize]) -> bool {
@@ -242,8 +85,7 @@ fn prepare(source: Source, endpoint: &str) -> Result<Vec<(String, String)>, GitA
     // can disappear while delivery is queued; its objects still live here.
     let repo = from_bare_repository(&source.git_dir)?;
     let shas: Vec<_> = source.commits.keys().cloned().collect();
-    let patch_ids =
-        crate::authorship::rewrite_cherry_pick::stable_patch_ids_for_commits(&repo, &shas)?;
+    let patch_ids = crate::commit_links::git::stable_patch_ids_for_commits(&repo, &shas)?;
     let mut args = repo.global_args_for_exec();
     args.extend(
         [
@@ -286,7 +128,11 @@ fn prepare(source: Source, endpoint: &str) -> Result<Vec<(String, String)>, GitA
             if let Some(url) = &source.repo_url {
                 attributes.push(string_attribute("vcs.repository.url.full", url));
             }
-            let record = json!({"timeUnixNano": source.time_unix_nano, "severityNumber": 9, "severityText": "INFO",
+            let time = source
+                .commit_times
+                .get(sha)
+                .unwrap_or(&source.time_unix_nano);
+            let record = json!({"timeUnixNano": time, "severityNumber": 9, "severityText": "INFO",
                 "body": {"stringValue": EVENT}, "attributes": attributes});
             let identity = serde_json::to_string(&(
                 endpoint,
@@ -306,6 +152,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v2_existing_outbox_source_payload_remains_readable() {
+        let source: Source = serde_json::from_value(json!({
+            "git_dir":"/repo/.git", "repo_url":null, "time_unix_nano":"123",
+            "commits":{"abc":[{"agent":"codex","id":"original-id"}]}
+        }))
+        .unwrap();
+        assert!(source.commit_times.is_empty());
+        assert_eq!(source.time_unix_nano, "123");
+        assert_eq!(
+            source.commits["abc"].iter().next().unwrap().id,
+            "original-id"
+        );
+    }
+
+    #[test]
     fn otel_agent_mapping_preserves_external_ids_and_rejects_placeholders() {
         for (tool, expected) in [
             ("claude", Some("claude-code")),
@@ -315,28 +176,26 @@ mod tests {
             ("codex", Some("codex")),
             ("devin", Some("devin")),
             ("mock_ai", None),
-            ("cursor", None),
+            ("cursor", Some("cursor")),
+            ("windsurf", Some("windsurf")),
+            ("cline", Some("cline")),
+            ("gemini", Some("gemini")),
+            ("continue-cli", Some("continue-cli")),
+            ("amp", Some("amp")),
+            ("firebender", Some("firebender")),
+            ("agent-v1", Some("agent-v1")),
+            ("droid", Some("droid")),
+            ("opencode", Some("opencode")),
+            ("pi", Some("pi")),
         ] {
-            let agent = AgentId {
-                tool: tool.into(),
-                id: "exact_external_id".into(),
-                model: "unused".into(),
-            };
-            let mapped = session(&agent);
+            let mapped = SessionIdentity::new(tool, "exact_external_id");
             assert_eq!(mapped.as_ref().map(|s| s.agent.as_str()), expected);
             if let Some(mapped) = mapped {
-                assert_eq!(mapped.id, agent.id);
+                assert_eq!(mapped.id, "exact_external_id");
             }
         }
         for id in ["", "unknown", "DEVIN_SESSION123"] {
-            assert!(
-                session(&AgentId {
-                    tool: "devin".into(),
-                    id: id.into(),
-                    model: String::new()
-                })
-                .is_none()
-            );
+            assert!(SessionIdentity::new("devin", id).is_none());
         }
     }
 }

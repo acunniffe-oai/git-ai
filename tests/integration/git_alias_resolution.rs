@@ -1,4 +1,3 @@
-use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::commands::git_handlers::resolve_alias_invocation;
 use git_ai::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
@@ -173,92 +172,44 @@ fn alias_with_double_quotes() {
     );
 }
 
-// ─── E2E: aliased commit triggers hooks ──────────────────────────────────────
-
 #[test]
-fn aliased_commit_triggers_authorship_hooks() {
+fn aliased_commit_triggers_session_linking() {
     let repo = TestRepo::new();
-
-    // TestRepo routes real Git trace2 events through the daemon with the
-    // default nesting value, so this covers aliases under nesting=0.
-    // Configure alias: ci = commit
     repo.git(&["config", "alias.ci", "commit"]).unwrap();
-
-    // Create a file with AI-authored content (set_contents handles checkpoints)
-    let mut file = repo.filename("feature.rs");
-    file.set_contents(crate::lines![
-        "fn hello() {".ai(),
-        "  println!(\"hello\");".ai(),
-        "}".ai(),
-    ]);
-
-    // Stage all changes
+    let path = repo.path().join("feature.rs");
+    std::fs::write(&path, "fn hello() {}\n").unwrap();
+    crate::test_utils::codex_checkpoint(&repo, &path, "alias-session", "PostToolUse", "write-1");
     repo.git(&["add", "-A"]).unwrap();
-
-    // Commit using the alias — hooks should still fire
-    repo.git(&["ci", "-m", "Add AI feature"])
-        .expect("aliased commit should succeed");
-
-    // Verify authorship was tracked by the commit hooks
-    file.assert_lines_and_blame(crate::lines![
-        "fn hello() {".ai(),
-        "  println!(\"hello\");".ai(),
-        "}".ai(),
-    ]);
+    repo.git(&["ci", "-m", "aliased commit"]).unwrap();
+    let sha = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    repo.assert_commit_links(sha.trim(), &[("codex", "alias-session")]);
 }
 
 #[test]
-fn aliased_commit_with_extra_flags_triggers_authorship_hooks() {
+fn aliased_commit_with_extra_flags_triggers_session_linking() {
     let repo = TestRepo::new();
-
-    // Configure alias: ci = commit -v
     repo.git(&["config", "alias.ci", "commit -v"]).unwrap();
-
-    // Create a file with mixed human and AI content
-    let mut file = repo.filename("lib.rs");
-    file.set_contents(crate::lines![
-        "// human-written module header".human(),
-        "pub fn generated() -> i32 {".ai(),
-        "    42".ai(),
-        "}".ai(),
-    ]);
-
+    let path = repo.path().join("feature.rs");
+    std::fs::write(&path, "fn hello() {}\n").unwrap();
+    crate::test_utils::codex_checkpoint(&repo, &path, "alias-session", "PostToolUse", "write-1");
     repo.git(&["add", "-A"]).unwrap();
-    repo.git(&["ci", "-m", "Add generated function"])
-        .expect("aliased commit with flags should succeed");
-
-    // Verify mixed authorship was correctly tracked
-    file.assert_lines_and_blame(crate::lines![
-        "// human-written module header".human(),
-        "pub fn generated() -> i32 {".ai(),
-        "    42".ai(),
-        "}".ai(),
-    ]);
+    repo.git(&["ci", "-m", "aliased commit with flags"])
+        .unwrap();
+    let sha = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    repo.assert_commit_links(sha.trim(), &[("codex", "alias-session")]);
 }
 
-// ─── E2E: aliased push triggers hooks ────────────────────────────────────────
-
 #[test]
-fn aliased_push_succeeds_with_hooks() {
+fn aliased_push_preserves_local_links() {
     let (local, _upstream) = TestRepo::new_with_remote();
-
-    // Configure alias: p = push
     local.git(&["config", "alias.p", "push"]).unwrap();
-
-    // Create and commit a file with AI content
-    let mut file = local.filename("module.py");
-    file.set_contents(crate::lines!["def ai_func():".ai(), "    return True".ai(),]);
-    local
-        .stage_all_and_commit("Add AI module")
-        .expect("commit should succeed");
-
-    // Push to set up tracking branch using alias — push hooks should fire
-    local
-        .git(&["p", "-u", "origin", "HEAD"])
-        .expect("aliased push should succeed");
-
-    // Verify authorship is intact after aliased push
-    file.assert_lines_and_blame(crate::lines!["def ai_func():".ai(), "    return True".ai(),]);
+    let path = local.path().join("module.py");
+    std::fs::write(&path, "print('hello')\n").unwrap();
+    crate::test_utils::codex_checkpoint(&local, &path, "push-session", "PostToolUse", "write-1");
+    let commit = local.stage_all_and_commit("local contribution").unwrap();
+    local.assert_commit_links(&commit.commit_sha, &[("codex", "push-session")]);
+    local.git(&["p", "-u", "origin", "HEAD"]).unwrap();
+    local.assert_commit_links(&commit.commit_sha, &[("codex", "push-session")]);
 }
 
 crate::reuse_tests_in_worktree!(
@@ -273,7 +224,7 @@ crate::reuse_tests_in_worktree!(
     alias_to_non_hooked_command,
     alias_with_no_extra_args,
     alias_with_double_quotes,
-    aliased_commit_triggers_authorship_hooks,
-    aliased_commit_with_extra_flags_triggers_authorship_hooks,
-    aliased_push_succeeds_with_hooks,
+    aliased_commit_triggers_session_linking,
+    aliased_commit_with_extra_flags_triggers_session_linking,
+    aliased_push_preserves_local_links,
 );

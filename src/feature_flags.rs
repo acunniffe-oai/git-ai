@@ -78,17 +78,8 @@ macro_rules! define_feature_flags {
 // Define all feature flags in one place
 // Format: struct_field: file_and_env_name, debug = <bool>, release = <bool>
 define_feature_flags!(
-    lite_mode: lite_mode, debug = false, release = false,
     auth_keyring: auth_keyring, debug = false, release = false,
-    transcript_streaming: transcript_streaming, debug = true, release = true,
-    transcript_sweep: transcript_sweep, debug = true, release = true,
-    checkpoint_debug_log: checkpoint_debug_log, debug = false, release = false,
-    bash_checkpoints_v2: bash_checkpoints_v2, debug = false, release = false,
     daemon_log_upload: daemon_log_upload, debug = true, release = true,
-    rewrite_metrics_events: rewrite_metrics_events, debug = true, release = false,
-    token_usage_metrics: token_usage_metrics, debug = true, release = true,
-    untraced_commit_fixup: untraced_commit_fixup, debug = true, release = true,
-    untraced_fixup_ignore_temp_repos: untraced_fixup_ignore_temp_repos, debug = true, release = true,
 );
 
 impl FeatureFlags {
@@ -132,213 +123,24 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_default_feature_flags() {
-        let flags = FeatureFlags::default();
-        #[cfg(debug_assertions)]
-        {
-            assert!(!flags.lite_mode);
-            assert!(!flags.auth_keyring);
-            assert!(flags.transcript_streaming);
-            assert!(flags.transcript_sweep);
-            assert!(!flags.checkpoint_debug_log);
-            assert!(!flags.bash_checkpoints_v2);
-            assert!(flags.daemon_log_upload);
-            assert!(flags.rewrite_metrics_events);
-            assert!(flags.token_usage_metrics);
-            assert!(flags.untraced_commit_fixup);
-            assert!(flags.untraced_fixup_ignore_temp_repos);
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            assert!(!flags.lite_mode);
-            assert!(!flags.auth_keyring);
-            assert!(flags.transcript_streaming);
-            assert!(flags.transcript_sweep);
-            assert!(!flags.checkpoint_debug_log);
-            assert!(!flags.bash_checkpoints_v2);
-            assert!(flags.daemon_log_upload);
-            assert!(!flags.rewrite_metrics_events);
-            assert!(flags.token_usage_metrics);
-            assert!(flags.untraced_commit_fixup);
-            assert!(flags.untraced_fixup_ignore_temp_repos);
-        }
-    }
-
-    #[test]
-    fn test_lite_mode_file_override() {
-        let deserializable = DeserializableFeatureFlags {
-            lite_mode: Some(true),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_deserializable(deserializable);
-        assert!(flags.lite_mode);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_lite_mode_env_overrides_file() {
-        unsafe {
-            std::env::set_var("GIT_AI_LITE_MODE", "true");
-        }
-
-        let file_flags = DeserializableFeatureFlags {
-            lite_mode: Some(false),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_env_and_file(Some(file_flags));
-        assert!(flags.lite_mode);
-
-        unsafe {
-            std::env::remove_var("GIT_AI_LITE_MODE");
-        }
-    }
-
-    #[test]
-    fn test_from_deserializable() {
-        let deserializable = DeserializableFeatureFlags {
-            auth_keyring: Some(true),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_deserializable(deserializable);
-        assert!(flags.auth_keyring);
-    }
-
-    #[test]
-    fn test_rewrite_metrics_events_file_override() {
-        let deserializable = DeserializableFeatureFlags {
-            rewrite_metrics_events: Some(false),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_deserializable(deserializable);
-        assert!(!flags.rewrite_metrics_events);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_from_env_and_file_defaults_only() {
-        unsafe {
-            std::env::remove_var("GIT_AI_AUTH_KEYRING");
-            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
-        }
-
-        let flags = FeatureFlags::from_env_and_file(None);
+    fn retained_defaults_and_file_overrides() {
         let defaults = FeatureFlags::default();
-        assert_eq!(flags.auth_keyring, defaults.auth_keyring);
-        assert_eq!(
-            flags.rewrite_metrics_events,
-            defaults.rewrite_metrics_events
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_from_env_and_file_file_overrides() {
-        unsafe {
-            std::env::remove_var("GIT_AI_AUTH_KEYRING");
-            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
-        }
-
-        let file_flags = DeserializableFeatureFlags {
+        assert!(!defaults.auth_keyring);
+        assert!(defaults.daemon_log_upload);
+        let flags = FeatureFlags::from_deserializable(DeserializableFeatureFlags {
             auth_keyring: Some(true),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_env_and_file(Some(file_flags));
+            daemon_log_upload: Some(false),
+        });
         assert!(flags.auth_keyring);
+        assert!(!flags.daemon_log_upload);
     }
-
     #[test]
-    #[serial_test::serial]
-    fn test_rewrite_metrics_events_env_overrides_file() {
-        unsafe {
-            std::env::set_var("GIT_AI_REWRITE_METRICS_EVENTS", "true");
-        }
-
-        let file_flags = DeserializableFeatureFlags {
-            rewrite_metrics_events: Some(false),
-            ..Default::default()
-        };
-
-        let flags = FeatureFlags::from_env_and_file(Some(file_flags));
-        assert!(flags.rewrite_metrics_events);
-
-        unsafe {
-            std::env::remove_var("GIT_AI_REWRITE_METRICS_EVENTS");
-        }
-    }
-
-    #[test]
-    fn test_serialization() {
-        let flags = FeatureFlags {
-            lite_mode: true,
-            auth_keyring: true,
-            transcript_streaming: true,
-            transcript_sweep: true,
-            checkpoint_debug_log: false,
-            bash_checkpoints_v2: true,
-            daemon_log_upload: true,
-            rewrite_metrics_events: true,
-            token_usage_metrics: true,
-            untraced_commit_fixup: true,
-            untraced_fixup_ignore_temp_repos: true,
-        };
-
-        let serialized = serde_json::to_string(&flags).unwrap();
-        assert!(serialized.contains("lite_mode"));
-        assert!(serialized.contains("auth_keyring"));
-        assert!(serialized.contains("transcript_streaming"));
-        assert!(serialized.contains("transcript_sweep"));
-        assert!(serialized.contains("checkpoint_debug_log"));
-        assert!(serialized.contains("bash_checkpoints_v2"));
-        assert!(serialized.contains("daemon_log_upload"));
-        assert!(serialized.contains("rewrite_metrics_events"));
-        assert!(serialized.contains("token_usage_metrics"));
-        assert!(serialized.contains("untraced_commit_fixup"));
-        assert!(serialized.contains("untraced_fixup_ignore_temp_repos"));
-    }
-
-    #[test]
-    fn test_clone_trait() {
-        let flags = FeatureFlags {
-            lite_mode: true,
-            auth_keyring: true,
-            transcript_streaming: true,
-            transcript_sweep: true,
-            checkpoint_debug_log: true,
-            bash_checkpoints_v2: true,
-            daemon_log_upload: true,
-            rewrite_metrics_events: true,
-            token_usage_metrics: true,
-            untraced_commit_fixup: false,
-            untraced_fixup_ignore_temp_repos: true,
-        };
-        let cloned = flags.clone();
-        assert_eq!(cloned.lite_mode, flags.lite_mode);
-        assert_eq!(cloned.auth_keyring, flags.auth_keyring);
-        assert_eq!(cloned.transcript_streaming, flags.transcript_streaming);
-        assert_eq!(cloned.transcript_sweep, flags.transcript_sweep);
-        assert_eq!(cloned.checkpoint_debug_log, flags.checkpoint_debug_log);
-        assert_eq!(cloned.bash_checkpoints_v2, flags.bash_checkpoints_v2);
-        assert_eq!(cloned.daemon_log_upload, flags.daemon_log_upload);
-        assert_eq!(cloned.rewrite_metrics_events, flags.rewrite_metrics_events);
-        assert_eq!(cloned.token_usage_metrics, flags.token_usage_metrics);
-        assert_eq!(cloned.untraced_commit_fixup, flags.untraced_commit_fixup);
-        assert_eq!(
-            cloned.untraced_fixup_ignore_temp_repos,
-            flags.untraced_fixup_ignore_temp_repos
-        );
-    }
-
-    #[test]
-    fn test_debug_trait() {
-        let flags = FeatureFlags::default();
-        let debug_str = format!("{:?}", flags);
-        assert!(debug_str.contains("FeatureFlags"));
+    fn ignored_legacy_flag_values_do_not_break_retained_flags() {
+        let file = serde_json::from_str::<DeserializableFeatureFlags>(
+            r#"{"transcript_streaming":"ignored","auth_keyring":true}"#,
+        )
+        .unwrap();
+        assert!(FeatureFlags::from_deserializable(file).auth_keyring);
     }
 }

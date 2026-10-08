@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
-use git_ai::authorship::stats::CommitStats;
 use git_ai::config::ConfigPatch;
 use git_ai::daemon::{
     ControlRequest, DaemonClientStream, DaemonConfig, local_socket_connects_with_timeout,
@@ -9,7 +7,6 @@ use git_ai::daemon::{
 };
 use git_ai::feature_flags::FeatureFlags;
 use git_ai::git::cli_parser::{ParsedGitInvocation, extract_clone_target_directory};
-use git_ai::git::repo_storage::PersistedWorkingLog;
 use git_ai::git::repository as GitAiRepository;
 // BenchmarkResult for performance testing
 #[derive(Debug, Clone)]
@@ -19,7 +16,6 @@ pub struct BenchmarkResult {
     pub post_command_duration: Duration,
     pub pre_command_duration: Duration,
 }
-use insta::{Settings, assert_debug_snapshot};
 use rand::RngExt;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -223,19 +219,6 @@ impl DaemonProcess {
                 .env("GIT_AI_DAEMON_HOME", test_home)
                 .env("GIT_AI_DAEMON_CONTROL_SOCKET", &control_socket_path)
                 .env("GIT_AI_DAEMON_TRACE_SOCKET", &trace_socket_path)
-                // The untraced-commit fixup timer only fires in tests that opt
-                // in with a short interval; everything else drives it with
-                // `fixup.scan` so untraced git stays deterministic. A stress
-                // run can turn the timer on for every test daemon through
-                // GIT_AI_TEST_UNTRACED_FIXUP_INTERVAL_MS.
-                .env(
-                    "GIT_AI_DAEMON_UNTRACED_FIXUP_INTERVAL_MS",
-                    std::env::var("GIT_AI_TEST_UNTRACED_FIXUP_INTERVAL_MS")
-                        .unwrap_or_else(|_| "3600000".to_string()),
-                )
-                // Every TestRepo lives under the OS temp dir, which the fixup
-                // ignores by default; tests that cover that rule opt back in.
-                .env("GIT_AI_UNTRACED_FIXUP_IGNORE_TEMP_REPOS", "false")
                 .stdout(Stdio::null())
                 .stderr(
                     stderr_log
@@ -507,15 +490,6 @@ impl DaemonProcess {
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
     command.env("HOME", test_home);
-    if !command
-        .get_envs()
-        .any(|(key, _)| key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
-    {
-        command.env(
-            "GIT_AI_TEST_NOTES_DB_PATH",
-            test_home.join(".git-ai").join("internal").join("notes-db"),
-        );
-    }
     command.env("GIT_CONFIG_GLOBAL", test_home.join(".gitconfig"));
     // Redirect XDG_CONFIG_HOME so git does not read the real user's
     // $XDG_CONFIG_HOME/git/config (which may contain filter drivers,
@@ -608,74 +582,37 @@ fn run_command_output_with_timeout(
 }
 
 fn collect_child_output_with_timeout(
-    mut child: Child,
+    child: Child,
     label: &str,
     debug_command: String,
     timeout: Duration,
 ) -> Result<Output, String> {
     let pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("{label} child stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("{label} child stderr was not piped"))?;
-
-    let stdout_reader = thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
-        buffer
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut buffer = Vec::new();
-        let _ = stderr.read_to_end(&mut buffer);
-        buffer
-    });
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                return Err(format!(
-                    "failed polling {label} child process {pid}: {error}\ncommand: {debug_command}\nstdout tail:\n{}\nstderr tail:\n{}",
-                    output_tail(&stdout),
-                    output_tail(&stderr)
-                ));
-            }
-        }
-
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
-            return Err(format!(
-                "{label} timed out after {timeout:?} (pid {pid})\ncommand: {debug_command}\nstdout tail:\n{}\nstderr tail:\n{}",
-                output_tail(&stdout),
-                output_tail(&stderr)
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(10));
+    let output = git_ai::process_timeout::collect_child_output_with_timeout(
+        child,
+        timeout,
+        Duration::from_millis(10),
+    );
+    if output.timed_out || output.wait_error.is_some() {
+        return Err(format!(
+            "{label} failed while collecting child {pid}: timed_out={}, wait_error={:?}\ncommand: {debug_command}\nstdout tail:\n{}\nstderr tail:\n{}\ndiagnostics: {:?}",
+            output.timed_out,
+            output.wait_error,
+            output_tail(&output.stdout),
+            output_tail(&output.stderr),
+            output.diagnostics
+        ));
     }
+    if !output.diagnostics.is_empty() {
+        eprintln!("{label} output collection: {:?}", output.diagnostics);
+    }
+    Ok(Output {
+        status: output
+            .status
+            .ok_or_else(|| format!("{label} exited without a status"))?,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 fn output_tail(bytes: &[u8]) -> String {
@@ -843,9 +780,7 @@ where
         }
         let _reset = Reset { flag, previous };
 
-        let mut settings = Settings::clone_current();
-        settings.set_snapshot_suffix("worktree");
-        settings.bind(f)
+        f()
     })
 }
 
@@ -1026,70 +961,15 @@ fn git_ai_primary_command<'a>(args: &'a [&'a str]) -> Option<&'a str> {
     args.iter().copied().find(|arg| !arg.starts_with('-'))
 }
 
-fn is_known_checkpoint_preset(arg: &str) -> bool {
-    matches!(
-        arg,
-        "claude"
-            | "codex"
-            | "continue-cli"
-            | "cursor"
-            | "gemini"
-            | "github-copilot"
-            | "amp"
-            | "windsurf"
-            | "opencode"
-            | "pi"
-            | "ai_tab"
-            | "firebender"
-            | "mock_ai"
-            | "mock_known_human"
-            | "known_human"
-            | "droid"
-            | "agent-v1"
-    )
+fn is_known_checkpoint_preset(name: &str) -> bool {
+    git_ai::commands::checkpoint_agent::presets::resolve_preset(name).is_ok()
 }
 
 fn normalize_test_git_ai_checkpoint_args(args: &[&str]) -> Vec<String> {
-    let original = args
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect::<Vec<_>>();
-    if git_ai_primary_command(args) != Some("checkpoint") || args.len() <= 1 {
-        return original;
-    }
-
-    if args.contains(&"--") {
-        return original;
-    }
-
-    let mut normalized = vec![args[0].to_string()];
-    let mut i = 1usize;
-    while i < args.len() {
-        match args[i] {
-            "--hook-input" => {
-                normalized.push(args[i].to_string());
-                if let Some(value) = args.get(i + 1) {
-                    normalized.push((*value).to_string());
-                }
-                i += 2;
-            }
-            arg if arg.starts_with("--hook-input=") || arg.starts_with('-') => {
-                normalized.push(arg.to_string());
-                i += 1;
-            }
-            arg if is_known_checkpoint_preset(arg) => return original,
-            _ => {
-                normalized.push("--".to_string());
-                normalized.extend(args[i..].iter().map(|arg| (*arg).to_string()));
-                return normalized;
-            }
-        }
-    }
-
-    normalized
+    args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
-fn parse_checkpoint_request_count(stdout: &str) -> u64 {
+pub(crate) fn parse_checkpoint_request_count(stdout: &str) -> u64 {
     for line in stdout.lines() {
         if let Some(val) = line.strip_prefix("checkpoint_requests=") {
             return val.trim().parse().unwrap_or(0);
@@ -1099,19 +979,7 @@ fn parse_checkpoint_request_count(stdout: &str) -> u64 {
 }
 
 fn git_ai_command_requires_daemon_sync(args: &[&str]) -> bool {
-    matches!(
-        git_ai_primary_command(args),
-        Some(
-            "blame"
-                | "blame-analysis"
-                | "diff"
-                | "log"
-                | "show"
-                | "show-prompt"
-                | "stats"
-                | "status"
-        )
-    )
+    matches!(git_ai_primary_command(args), Some("await" | "debug"))
 }
 
 fn git_invocation_requires_daemon_sync(invocation: &ParsedGitInvocation) -> bool {
@@ -1217,16 +1085,6 @@ impl TestRepo {
             );
         }
 
-        if let Some(exclude) = &patch.exclude_prompts_in_repositories {
-            let values = exclude
-                .iter()
-                .map(|pattern| serde_json::Value::String(pattern.clone()))
-                .collect();
-            config.insert(
-                "exclude_prompts_in_repositories".to_string(),
-                serde_json::Value::Array(values),
-            );
-        }
         if let Some(telemetry_oss_disabled) = patch.telemetry_oss_disabled {
             let value = if telemetry_oss_disabled { "off" } else { "on" };
             config.insert(
@@ -1246,48 +1104,8 @@ impl TestRepo {
                 serde_json::Value::Bool(disable_auto_updates),
             );
         }
-        if let Some(prompt_storage) = &patch.prompt_storage {
-            config.insert(
-                "prompt_storage".to_string(),
-                serde_json::Value::String(prompt_storage.clone()),
-            );
-        }
-        if let Some(custom_attributes) = &patch.custom_attributes {
-            let attrs_map: serde_json::Map<String, serde_json::Value> = custom_attributes
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            config.insert(
-                "custom_attributes".to_string(),
-                serde_json::Value::Object(attrs_map),
-            );
-        }
-        if let Some(author) = &patch.author {
-            config.insert(
-                "author".to_string(),
-                serde_json::to_value(author).expect("failed to serialize test author config"),
-            );
-        }
         if let Some(feature_flags) = &patch.feature_flags {
             config.insert("feature_flags".to_string(), feature_flags.clone());
-        }
-        if let Some(max_bytes) = patch.max_checkpoint_file_size_bytes {
-            config.insert(
-                "max_checkpoint_file_size_bytes".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(max_bytes as u64)),
-            );
-        }
-        if let Some(max_bytes) = patch.max_checkpoint_total_size_bytes {
-            config.insert(
-                "max_checkpoint_total_size_bytes".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(max_bytes as u64)),
-            );
-        }
-        if let Some(max_lines) = patch.max_checkpoint_total_lines {
-            config.insert(
-                "max_checkpoint_total_lines".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(max_lines as u64)),
-            );
         }
         if let Some(limit_mb) = patch.daemon_memory_limit_mb {
             config.insert(
@@ -1313,10 +1131,7 @@ impl TestRepo {
     }
 
     fn apply_default_config_patch(&mut self) {
-        self.patch_git_ai_config(|patch| {
-            patch.exclude_prompts_in_repositories = Some(vec![]); // No exclusions = share everywhere
-            patch.prompt_storage = Some("notes".to_string()); // Use notes mode for tests
-        });
+        self.patch_git_ai_config(|_| {});
     }
 
     pub fn new() -> Self {
@@ -1775,54 +1590,6 @@ impl TestRepo {
 
     pub fn set_feature_flags(&mut self, feature_flags: FeatureFlags) {
         self.feature_flags = feature_flags;
-    }
-
-    /// Runs one untraced-commit fixup pass for this repository's family and
-    /// waits for its side effects, like the daemon's periodic scan would.
-    pub(crate) fn request_untraced_fixup_scan(&self) -> serde_json::Value {
-        let response = send_control_request(
-            &self.daemon_control_socket_path(),
-            &ControlRequest::UntracedFixupScan {
-                repo_working_dir: Some(self.canonical_path().to_string_lossy().to_string()),
-            },
-        )
-        .expect("fixup.scan should reach the daemon");
-        assert!(response.ok, "fixup.scan failed: {:?}", response.error);
-        self.sync_daemon_force();
-        response.data.unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Runs one untraced-commit fixup pass for the family of `repo_working_dir`
-    /// (another repository than this one) and waits for it.
-    pub(crate) fn request_untraced_fixup_scan_for(
-        &self,
-        repo_working_dir: &Path,
-    ) -> serde_json::Value {
-        let response = send_control_request(
-            &self.daemon_control_socket_path(),
-            &ControlRequest::UntracedFixupScan {
-                repo_working_dir: Some(repo_working_dir.to_string_lossy().to_string()),
-            },
-        )
-        .expect("fixup.scan should reach the daemon");
-        assert!(response.ok, "fixup.scan failed: {:?}", response.error);
-        self.sync_daemon_force();
-        response.data.unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Runs one untraced-commit fixup pass over every family the daemon knows
-    /// (in memory or remembered from earlier lifetimes) and waits for it.
-    pub(crate) fn request_untraced_fixup_scan_all(&self) -> serde_json::Value {
-        let response = send_control_request(
-            &self.daemon_control_socket_path(),
-            &ControlRequest::UntracedFixupScan {
-                repo_working_dir: None,
-            },
-        )
-        .expect("fixup.scan should reach the daemon");
-        assert!(response.ok, "fixup.scan failed: {:?}", response.error);
-        self.sync_daemon_force();
-        response.data.unwrap_or(serde_json::Value::Null)
     }
 
     /// The daemon's health snapshot (`status.daemon`).
@@ -2636,39 +2403,6 @@ impl TestRepo {
         self.sync_daemon_force();
     }
 
-    pub fn stats(&self) -> Result<CommitStats, String> {
-        let output = self.git_ai(&["stats", "--json"])?;
-        let start = output
-            .find('{')
-            .ok_or_else(|| format!("stats output does not contain JSON: {}", output))?;
-
-        let mut depth = 0usize;
-        let mut end_index = None;
-        for (offset, ch) in output[start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    if depth == 0 {
-                        return Err(format!("malformed stats JSON output: {}", output));
-                    }
-                    depth -= 1;
-                    if depth == 0 {
-                        end_index = Some(start + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let end_index =
-            end_index.ok_or_else(|| format!("incomplete stats JSON output: {}", output))?;
-        let json = &output[start..=end_index];
-        let stats: CommitStats =
-            serde_json::from_str(json).map_err(|e| format!("invalid stats JSON: {}", e))?;
-        Ok(stats)
-    }
-
     pub fn current_branch(&self) -> String {
         self.git(&["branch", "--show-current"])
             .unwrap()
@@ -3220,7 +2954,7 @@ impl TestRepo {
     pub fn filename(&self, filename: &str) -> TestFile<'_> {
         let file_path = self.path.join(filename);
 
-        // If file exists, populate from existing file with blame
+        // Preserve existing content when opening a test file.
         if file_path.exists() {
             TestFile::from_existing_file(file_path, self)
         } else {
@@ -3229,82 +2963,31 @@ impl TestRepo {
         }
     }
 
-    pub fn current_working_logs(&self) -> PersistedWorkingLog {
-        let commit_sha = {
-            let repo = GitAiRepository::find_repository_in_path(self.path.to_str().unwrap())
-                .expect("Failed to find repository");
-            // Get the current HEAD commit SHA, or use "initial" for empty repos
-            repo.head()
-                .ok()
-                .and_then(|head| head.target().ok())
-                .unwrap_or_else(|| "initial".to_string())
-        };
-        self.working_logs_for_base_commit(&commit_sha)
-    }
-
-    /// Opens the working log for `base_commit` after synchronizing the daemon,
-    /// so accepted-but-unprocessed checkpoints are visible to the read. Tests
-    /// must use this (or `current_working_logs`) instead of reading working
-    /// logs through raw storage APIs whenever checkpoints were issued through
-    /// the daemon.
-    pub fn working_logs_for_base_commit(&self, base_commit: &str) -> PersistedWorkingLog {
-        self.working_logs_for_repo_path_and_base_commit(&self.path, base_commit)
-    }
-
-    /// As [`Self::working_logs_for_base_commit`], but for a specific repo or
-    /// worktree path (e.g. a linked worktree that shares this repo's family).
-    pub fn working_logs_for_repo_path_and_base_commit(
-        &self,
-        repo_path: &Path,
-        base_commit: &str,
-    ) -> PersistedWorkingLog {
+    /// Assert the exact durable local sessions after the daemon has processed
+    /// every command issued by this repository's test client.
+    pub fn assert_commit_links(&self, sha: &str, expected: &[(&str, &str)]) {
         self.sync_daemon_force();
-
-        let repo = GitAiRepository::find_repository_in_path(repo_path.to_str().unwrap())
-            .expect("Failed to find repository");
-        repo.storage
-            .working_log_for_base_commit(base_commit)
-            .unwrap()
+        let store =
+            git_ai::commit_links::store::LinkStore::open_at(&self.link_store_path_for_test())
+                .unwrap();
+        let actual = store
+            .sessions_for_commit(&self.daemon_family_key(), sha)
+            .unwrap();
+        let expected = expected
+            .iter()
+            .map(|(agent, id)| {
+                git_ai::commit_links::store::SessionIdentity::new(agent, id)
+                    .expect("valid expected session")
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "unexpected local sessions for commit {sha}"
+        );
     }
 
-    pub fn read_authorship_note(&self, commit_sha: &str) -> Option<String> {
-        self.git(&["notes", "--ref=ai", "show", commit_sha])
-            .ok()
-            .filter(|note| !note.trim().is_empty())
-    }
-
-    pub fn read_authorship_note_in_git_dir(
-        &self,
-        git_dir: &Path,
-        commit_sha: &str,
-    ) -> Option<String> {
-        self.sync_daemon_force();
-
-        let mut command = Command::new(real_git_executable());
-        configure_test_home_env(&mut command, &self.test_home);
-        command.args([
-            "--git-dir",
-            git_dir.to_str().expect("valid git dir"),
-            "--no-pager",
-            "notes",
-            "--ref=ai",
-            "show",
-            commit_sha,
-        ]);
-
-        let output = run_command_output(&mut command, "git notes show in git dir")
-            .expect("failed to run git notes show in git dir");
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let note = String::from_utf8_lossy(&output.stdout).to_string();
-        if note.trim().is_empty() {
-            None
-        } else {
-            Some(note)
-        }
+    pub fn link_store_path_for_test(&self) -> PathBuf {
+        self.test_db_path.with_extension("otel-db")
     }
 
     pub fn commit(&self, message: &str) -> Result<NewCommit, String> {
@@ -3359,31 +3042,8 @@ impl TestRepo {
 
                 self.sync_daemon_force();
 
-                // In daemon mode, the authorship note may not be immediately
-                // visible after the session completes due to filesystem flush
-                // timing. Retry briefly before failing.
-                let mut content = git_ai::git::notes_api::read_note(&repo, &head_commit);
-                if content.is_none() {
-                    for _ in 0..10 {
-                        thread::sleep(Duration::from_millis(50));
-                        content = git_ai::git::notes_api::read_note(&repo, &head_commit);
-                        if content.is_some() {
-                            break;
-                        }
-                    }
-                }
-                let content = content.ok_or_else(|| {
-                    format!(
-                        "No authorship log found for new commit {} after daemon sync",
-                        head_commit
-                    )
-                })?;
-                let authorship_log = AuthorshipLog::deserialize_from_string(&content)
-                    .map_err(|e| format!("Failed to parse authorship log: {}", e))?;
-
                 Ok(NewCommit {
                     commit_sha: head_commit,
-                    authorship_log,
                     stdout: combined,
                 })
             }
@@ -3564,19 +3224,8 @@ fn is_transient_git_index_lock_error(stderr: &str) -> bool {
 
 #[derive(Debug)]
 pub struct NewCommit {
-    pub authorship_log: AuthorshipLog,
     pub stdout: String,
     pub commit_sha: String,
-}
-
-impl NewCommit {
-    pub fn assert_authorship_snapshot(&self) {
-        assert_debug_snapshot!(self.authorship_log);
-    }
-    pub fn print_authorship(&self) {
-        // Debug method to print authorship log
-        println!("{}", self.authorship_log.serialize_to_string().unwrap());
-    }
 }
 
 static DEFAULT_BRANCH_NAME: OnceLock<String> = OnceLock::new();
@@ -4042,79 +3691,28 @@ pub fn get_binary_path() -> &'static PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn test_configure_test_home_env_isolates_notes_database() {
-        let test_home = PathBuf::from("isolated-test-home");
-        let mut command = Command::new("git");
-
-        configure_test_home_env(&mut command, &test_home);
-
-        let notes_db_path = command
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
-            .and_then(|(_, value)| value)
-            .map(PathBuf::from);
-        assert_eq!(
-            notes_db_path,
-            Some(test_home.join(".git-ai").join("internal").join("notes-db"))
-        );
-    }
-
-    #[test]
-    fn test_configure_test_home_env_preserves_explicit_notes_database() {
-        let test_home = PathBuf::from("isolated-test-home");
-        let explicit_notes_db = PathBuf::from("explicit-notes-db");
-        let mut command = Command::new("git");
-        command.env("GIT_AI_TEST_NOTES_DB_PATH", &explicit_notes_db);
-
-        configure_test_home_env(&mut command, &test_home);
-
-        let notes_db_path = command
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
-            .and_then(|(_, value)| value)
-            .map(PathBuf::from);
-        assert_eq!(notes_db_path, Some(explicit_notes_db));
-    }
-
-    #[test]
-    fn test_normalize_test_git_ai_checkpoint_args_inserts_separator_for_direct_file() {
-        assert_eq!(
-            normalize_test_git_ai_checkpoint_args(&["checkpoint", "src/lib.rs"]),
-            vec!["checkpoint", "--", "src/lib.rs"]
-        );
-    }
-
-    #[test]
-    fn test_normalize_test_git_ai_checkpoint_args_preserves_known_presets_and_separator() {
-        assert_eq!(
-            normalize_test_git_ai_checkpoint_args(&["checkpoint", "mock_ai", "src/lib.rs"]),
-            vec!["checkpoint", "mock_ai", "src/lib.rs"]
-        );
-        assert_eq!(
-            normalize_test_git_ai_checkpoint_args(&["checkpoint", "--", "src/lib.rs"]),
-            vec!["checkpoint", "--", "src/lib.rs"]
-        );
-    }
-
-    #[test]
-    fn test_normalize_test_git_ai_checkpoint_args_handles_hook_input_before_pathspecs() {
-        assert_eq!(
-            normalize_test_git_ai_checkpoint_args(&[
-                "checkpoint",
-                "--hook-input",
-                "{\"cwd\":\"/tmp/repo\"}",
-                "src/lib.rs",
-                "src/main.rs",
-            ]),
-            vec![
-                "checkpoint",
-                "--hook-input",
-                "{\"cwd\":\"/tmp/repo\"}",
-                "--",
-                "src/lib.rs",
-                "src/main.rs",
-            ]
+    fn subprocess_output_collection_is_bounded_after_child_exit() {
+        let repo = TestRepo::new();
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(repo.path()).args([
+            "-c",
+            "printf 'early stdout\\n'; printf 'early stderr\\n' >&2; sleep 3 & exit 7",
+        ]);
+        let started = Instant::now();
+        let output = run_command_output_with_timeout(
+            &mut command,
+            "inherited output pipes",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"early stdout\n");
+        assert_eq!(output.stderr, b"early stderr\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "descendant-held pipes must not extend collection after the child exits"
         );
     }
 

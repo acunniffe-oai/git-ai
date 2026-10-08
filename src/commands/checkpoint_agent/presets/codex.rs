@@ -2,15 +2,11 @@ use super::opencode::OpenCodePreset;
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
-    PresetContext, StreamFormat, StreamSource,
+    PresetContext,
 };
-use crate::authorship::authorship_log_serialization::generate_session_id;
-use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
-use crate::mdm::utils::codex_home_dir;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct CodexPreset;
 
@@ -30,20 +26,6 @@ impl CodexPreset {
                     "session_id or thread_id not found in hook_input".to_string(),
                 )
             })
-    }
-
-    fn resolve_transcript_path(data: &serde_json::Value, session_id: &str) -> Option<String> {
-        if let Some(tp) = parse::optional_str(data, "transcript_path") {
-            return Some(tp.to_string());
-        }
-
-        crate::streams::agents::CodexAgent::find_rollout_path_for_session_in_home(
-            session_id,
-            &codex_home_dir(),
-        )
-        .ok()
-        .flatten()
-        .map(|p| p.to_string_lossy().into_owned())
     }
 
     fn extract_filepaths_from_tool_response(hook_data: &serde_json::Value) -> Vec<PathBuf> {
@@ -107,60 +89,12 @@ impl AgentPreset for CodexPreset {
         let is_bash = tool_class == ToolClass::Bash;
         let is_file_edit = tool_class == ToolClass::FileEdit;
 
-        let transcript_path = Self::resolve_transcript_path(&data, &session_id);
-
-        let mut metadata = HashMap::new();
-        if let Some(ref tp) = transcript_path {
-            metadata.insert("transcript_path".to_string(), tp.clone());
-        }
-
-        let model = parse::optional_str(&data, "model")
-            .map(str::to_string)
-            .or_else(|| {
-                transcript_path.as_ref().and_then(|tp| {
-                    crate::streams::model_extraction::extract_model(
-                        Path::new(tp),
-                        crate::streams::sweep::StreamFormat::CodexJsonl,
-                        None,
-                    )
-                    .ok()
-                    .flatten()
-                })
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
         let context = PresetContext {
-            agent_id: AgentId {
-                tool: "codex".to_string(),
-                id: session_id.clone(),
-                model,
-            },
+            agent: "codex".to_string(),
             external_session_id: session_id,
             trace_id: trace_id.to_string(),
             cwd: PathBuf::from(cwd),
-            metadata,
         };
-
-        // Stream identity must come from the rollout FILENAME, exactly like
-        // sweep discovery (see CodexAgent::discover_sessions). Fork/subagent
-        // rollouts report the parent thread's id in hook payloads; keying the
-        // stream by that id would track the same file a second time under a
-        // different identity, re-ingesting and double counting every line.
-        let stream_source = transcript_path.map(|tp| {
-            let path = PathBuf::from(tp);
-            let external_session_id =
-                crate::streams::agents::CodexAgent::external_session_id_from_rollout_path(&path)
-                    .unwrap_or_else(|| context.external_session_id.clone());
-            let external_parent_session_id =
-                crate::streams::agents::CodexAgent::detect_subagent_parent(&path);
-            StreamSource {
-                path,
-                format: StreamFormat::CodexJsonl,
-                session_id: generate_session_id(&external_session_id, "codex"),
-                external_session_id,
-                external_parent_session_id,
-            }
-        });
 
         let bash_command = parse::bash_command_from_hook_input(&data);
         let event = match hook_event {
@@ -175,7 +109,6 @@ impl AgentPreset for CodexPreset {
                     ParsedHookEvent::PreFileEdit(PreFileEdit {
                         context,
                         file_paths: vec![],
-                        dirty_files: None,
                         tool_use_id: Some(tool_use_id.to_string()),
                     })
                 } else {
@@ -191,7 +124,6 @@ impl AgentPreset for CodexPreset {
                         context,
                         tool_use_id: tool_use_id.to_string(),
                         command: bash_command,
-                        stream_source,
                     })
                 } else if is_file_edit {
                     let tool_input = data.get("tool_input").or_else(|| data.get("toolInput"));
@@ -205,8 +137,6 @@ impl AgentPreset for CodexPreset {
                     ParsedHookEvent::PostFileEdit(PostFileEdit {
                         context,
                         file_paths,
-                        dirty_files: None,
-                        stream_source,
                         tool_use_id: Some(tool_use_id.to_string()),
                     })
                 } else {
@@ -225,357 +155,5 @@ impl AgentPreset for CodexPreset {
         };
 
         Ok(vec![event])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::checkpoint_agent::presets::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_codex_pre_bash_call() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "session_id": "codex-sess-1",
-            "tool_use_id": "tu-1",
-            "model": "o3",
-            "tool_input": {"command": "echo hello"},
-            "transcript_path": "/home/user/.codex/sessions/test.jsonl"
-        })
-        .to_string();
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PreBashCall(e) => {
-                assert_eq!(e.context.agent_id.tool, "codex");
-                assert_eq!(e.context.external_session_id, "codex-sess-1");
-                assert_eq!(e.context.agent_id.model, "o3");
-                assert_eq!(e.tool_use_id, "tu-1");
-                assert_eq!(e.command.as_deref(), Some("echo hello"));
-            }
-            _ => panic!("Expected PreBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_post_bash_call() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "session_id": "codex-sess-1",
-            "tool_use_id": "tu-1",
-            "tool_input": {"command": "echo hello"},
-            "transcript_path": "/home/user/.codex/sessions/test.jsonl"
-        })
-        .to_string();
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                assert_eq!(e.context.agent_id.tool, "codex");
-                assert!(matches!(
-                    e.stream_source,
-                    Some(StreamSource {
-                        format: StreamFormat::CodexJsonl,
-                        ..
-                    })
-                ));
-                assert_eq!(e.command.as_deref(), Some("echo hello"));
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_uses_transcript_model_when_hook_model_missing() {
-        use std::io::Write;
-
-        let mut transcript = tempfile::NamedTempFile::with_suffix(".jsonl").unwrap();
-        transcript
-            .write_all(br#"{"type":"session_meta","payload":{"model":"gpt-5.3-codex"}}"#)
-            .unwrap();
-        transcript.flush().unwrap();
-
-        let transcript_path = transcript.path().to_string_lossy().to_string();
-
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "session_id": "codex-sess-1",
-            "tool_use_id": "tu-1",
-            "transcript_path": transcript_path
-        })
-        .to_string();
-
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                assert_eq!(e.context.agent_id.model, "gpt-5.3-codex");
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_stream_identity_follows_rollout_filename() {
-        use std::io::Write;
-
-        // Subagent/fork rollouts report the PARENT thread id in hook
-        // payloads, but the stream identity must come from the child file's
-        // own UUID (matching sweep discovery) so the file isn't tracked and
-        // uploaded twice under two identities.
-        let parent_id = "01a00000-0000-7000-8000-000000000001";
-        let child_id = "01a00000-0000-7000-8000-000000000002";
-
-        let dir = tempfile::tempdir().unwrap();
-        let child_path = dir
-            .path()
-            .join(format!("rollout-2026-08-20T18-37-58-{}.jsonl", child_id));
-        let mut f = std::fs::File::create(&child_path).unwrap();
-        f.write_all(
-            format!(
-                r#"{{"type":"session_meta","payload":{{"id":"{}","session_id":"{}","forked_from_id":"{}","thread_source":"subagent","model":"gpt-5.1-codex"}}}}"#,
-                child_id, parent_id, parent_id
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        f.flush().unwrap();
-
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "session_id": parent_id,
-            "tool_use_id": "tu-1",
-            "transcript_path": child_path.to_string_lossy()
-        })
-        .to_string();
-
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                let source = e.stream_source.as_ref().expect("stream source");
-                assert_eq!(source.external_session_id, child_id);
-                assert_eq!(source.session_id, generate_session_id(child_id, "codex"));
-                assert_eq!(
-                    source.external_parent_session_id.as_deref(),
-                    Some(parent_id),
-                );
-                // Checkpoint attribution keeps the logical session id from
-                // the hook payload.
-                assert_eq!(e.context.external_session_id, parent_id);
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_plain_session_stream_identity_matches_hook_id() {
-        // The common case: a plain session's hook id IS the rollout filename
-        // UUID, so the filename-derived identity must equal the hook id and
-        // carry no parent — one stream row, same as before the fix.
-        let session = "01a00000-0000-7000-8000-00000000000a";
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join(format!("rollout-2026-02-06T20-35-49-{}.jsonl", session));
-        std::fs::write(
-            &path,
-            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n"),
-        )
-        .unwrap();
-
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "session_id": session,
-            "tool_use_id": "tu-1",
-            "transcript_path": path.to_string_lossy()
-        })
-        .to_string();
-
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                let source = e.stream_source.as_ref().expect("stream source");
-                assert_eq!(source.external_session_id, session);
-                assert_eq!(source.external_parent_session_id, None);
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_thread_id_fallback() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "thread_id": "thread-abc",
-            "tool_use_id": "tu-1"
-        })
-        .to_string();
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(e) => {
-                assert_eq!(e.context.external_session_id, "thread-abc");
-                assert!(e.stream_source.is_none());
-            }
-            _ => panic!("Expected PostBashCall"),
-        }
-    }
-
-    #[test]
-    fn test_codex_shell_tool_variants_treated_as_bash() {
-        for tool_name in &["exec_command", "shell", "shell_command"] {
-            let input = json!({
-                "cwd": "/home/user/project",
-                "hook_event_name": "PostToolUse",
-                "tool_name": tool_name,
-                "session_id": "codex-sess-1",
-                "tool_use_id": "exec-1"
-            })
-            .to_string();
-            let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-            assert_eq!(events.len(), 1);
-            match &events[0] {
-                ParsedHookEvent::PostBashCall(e) => {
-                    assert_eq!(e.context.agent_id.tool, "codex");
-                }
-                _ => panic!("Expected PostBashCall for {}", tool_name),
-            }
-        }
-    }
-
-    #[test]
-    fn test_codex_namespaced_tools_are_classified() {
-        for tool_name in &[
-            "functions.apply_patch",
-            "functions.exec_command",
-            "functions.Bash",
-            "multi_tool_use.parallel",
-        ] {
-            let input = json!({
-                "cwd": "/home/user/project",
-                "hook_event_name": "PostToolUse",
-                "tool_name": tool_name,
-                "session_id": "codex-sess-1",
-                "tool_use_id": "tu-1"
-            })
-            .to_string();
-            let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-            assert_eq!(events.len(), 1, "{} should parse to one event", tool_name);
-            match &events[0] {
-                ParsedHookEvent::PostBashCall(_) => {
-                    assert!(
-                        tool_name.ends_with("exec_command")
-                            || tool_name.ends_with("Bash")
-                            || *tool_name == "multi_tool_use.parallel",
-                        "{} should be bash",
-                        tool_name
-                    );
-                }
-                ParsedHookEvent::PostFileEdit(_) => {
-                    assert_eq!(
-                        *tool_name, "functions.apply_patch",
-                        "only apply_patch is a file edit"
-                    );
-                }
-                _ => panic!("Expected PostBashCall or PostFileEdit for {}", tool_name),
-            }
-        }
-    }
-
-    #[test]
-    fn test_codex_extracts_patch_file_paths_from_patch_and_command_keys() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "apply_patch",
-            "session_id": "codex-sess-1",
-            "tool_use_id": "patch-1",
-            "tool_input": {
-                "patch": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
-            }
-        })
-        .to_string();
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(
-                    e.file_paths,
-                    vec![PathBuf::from("/home/user/project/src/main.rs")]
-                );
-            }
-            _ => panic!("Expected PostFileEdit"),
-        }
-
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "functions.apply_patch",
-            "session_id": "codex-sess-1",
-            "tool_use_id": "patch-2",
-            "tool_input": {
-                "command": "*** Update File: /home/user/project/src/main.rs\n@@ old\n+new\n"
-            }
-        })
-        .to_string();
-        let events = CodexPreset.parse(&input, "t_test123456789a").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(
-                    e.file_paths,
-                    vec![PathBuf::from("/home/user/project/src/main.rs")]
-                );
-            }
-            _ => panic!("Expected PostFileEdit"),
-        }
-    }
-
-    #[test]
-    fn test_codex_rejects_non_bash_tool() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "write_file",
-            "session_id": "codex-sess-1"
-        })
-        .to_string();
-        let result = CodexPreset.parse(&input, "t_test123456789a");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_codex_missing_session_and_thread_id() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash"
-        })
-        .to_string();
-        let result = CodexPreset.parse(&input, "t_test123456789a");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_codex_rejects_unknown_event() {
-        let input = json!({
-            "cwd": "/home/user/project",
-            "hook_event_name": "SomeFutureEvent",
-            "session_id": "codex-sess-1"
-        })
-        .to_string();
-        let result = CodexPreset.parse(&input, "t_test123456789a");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported"));
     }
 }

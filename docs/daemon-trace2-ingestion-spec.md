@@ -4,7 +4,7 @@ Status: authoritative spec for how the git-ai daemon establishes exact
 ownership of git ref transitions from trace2 event streams. Companion docs:
 
 - `docs/rewrite-ops-spec.md` — what happens once exact transitions are known.
-- `docs/attribution-fuzzer-spec.md` — correctness pressure.
+- `tests/integration/v2_commit_links.rs` — session-set rewrite regressions.
 
 ## The problem: exact command ownership
 
@@ -16,7 +16,7 @@ may have moved on — more commands, user edits, other worktrees.
 Stock trace2 does not include created commit SHAs or complete ref-update OIDs
 for most commands. A delayed trace2 root saying "git commit ran in repo X
 with argv Y, exit 0" identifies *that a command ran*, not *which reflog
-entries it produced*. Attribution requires the latter.
+entries it produced*. Session linking requires the latter.
 
 **Ownership rule.** A ref-moving command's transitions are exact if and only
 if at least one of:
@@ -30,7 +30,7 @@ if at least one of:
    `update-ref ref <new> <old>`, `cherry-pick <sha1> <sha2>`).
 
 Otherwise the command is **not exact**: the daemon must fail closed for
-attribution (no guessed authorship, no note migration) and may only use the
+session linking (no guessed commits or rewrite mappings) and may only use the
 command as a *future baseline* — observe the current reflog ends so the *next*
 command is exact.
 
@@ -53,7 +53,7 @@ git (trace2 socket target)
   → RefCursor::enrich_command (src/daemon/ref_cursor.rs)
       consumes cursor-bounded reflog entries → cmd.ref_changes
   → analyzers (src/daemon/analyzers/history.rs)
-      classified semantic events → rewrite/post-commit side effects
+      classified semantic events → SQLite session-link updates
 ```
 
 Separation of concerns:

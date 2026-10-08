@@ -1,76 +1,28 @@
 #!/usr/bin/env bash
-# Feed synthetic checkpoint data through the pipeline and verify authorship notes.
+# Feed a content-free native session signal through the installed daemon.
 # Usage: test-synthetic-checkpoint.sh <agent> [repo-dir]
 set -euo pipefail
-
 AGENT="${1:?Usage: $0 <agent> [repo-dir]}"
 REPO_DIR="${2:-/tmp/test-repo}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/test-results}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$RESULTS_DIR"
-
 LOG="$RESULTS_DIR/synthetic-checkpoint-${AGENT}.txt"
-: > "$LOG"
-
-pass() { echo "PASS: $1" | tee -a "$LOG"; }
-warn() { echo "WARN: $1" | tee -a "$LOG"; }
-fail() { echo "FAIL: $1" | tee -a "$LOG"; exit 1; }
-
-echo "=== Synthetic checkpoint test for: $AGENT ===" | tee "$LOG"
-
+SESSION_ID="synthetic-${AGENT}-$(date +%s)"
+printf '%s\n' "$SESSION_ID" > "$RESULTS_DIR/synthetic-session-${AGENT}.txt"
 cd "$REPO_DIR"
-
-# Create a test file representing agent output
+REPO_DIR="$(pwd -P)"
 TEST_FILE="agent-test-${AGENT}.txt"
-echo "Hello from $AGENT synthetic test" > "$TEST_FILE"
+printf 'Hello from %s synthetic test\n' "$AGENT" > "$TEST_FILE"
 git add "$TEST_FILE"
-pass "Test file created and staged: $TEST_FILE"
-
-# Feed synthetic checkpoint data using the agent-v1 preset.
-# This format is documented and stable; the agent-v1 preset handles it uniformly.
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-CHECKPOINT_JSON=$(printf '{
-  "type": "ai_agent",
-  "repo_working_dir": "%s",
-  "edited_filepaths": ["%s"],
-  "transcript": {
-    "messages": [
-      {
-        "type": "user",
-        "text": "Create %s for synthetic CI test"
-      },
-      {
-        "type": "assistant",
-        "text": "Creating the file now."
-      }
-    ]
-  },
-  "agent_name": "%s",
-  "model": "synthetic-test-model",
-  "conversation_id": "synthetic-%s-%s"
-}' "$REPO_DIR" "$TEST_FILE" "$TEST_FILE" "$AGENT" "$AGENT" "$(date +%s)")
-
-echo "$CHECKPOINT_JSON" | git-ai checkpoint agent-v1 --hook-input stdin \
-  || fail "git-ai checkpoint agent-v1 command failed"
-pass "Synthetic checkpoint accepted by git-ai"
-
-# Commit the staged file
-git commit -m "Synthetic $AGENT checkpoint test" \
-  || fail "git commit failed after synthetic checkpoint"
-pass "Commit created successfully"
-
-# Verify authorship note was generated
-if git notes --ref=ai show HEAD 2>/dev/null \
-    | grep -qiE "authorship|schema_version|prompts|sessions"; then
-  pass "Authorship note found on HEAD"
-else
-  fail "No authorship note found on HEAD (post-commit hook may not have fired)"
-fi
-
-# Verify the blame output mentions AI attribution (non-fatal)
-if git-ai blame "$TEST_FILE" 2>/dev/null | grep -qiE "$AGENT|ai|attribution"; then
-  pass "AI attribution visible in blame output"
-else
-  warn "AI attribution not found in blame output for $AGENT (non-fatal)"
-fi
-
-echo "=== Synthetic checkpoint test COMPLETE for: $AGENT ===" | tee -a "$LOG"
+python3 - "$AGENT" "$REPO_DIR" "$TEST_FILE" "$SESSION_ID" <<'PAYLOAD' | git-ai checkpoint agent-v1 --hook-input stdin
+import json, sys
+agent, repo, path, session = sys.argv[1:]
+print(json.dumps({"type":"ai_agent", "repo_working_dir":repo,
+                  "edited_filepaths":[path], "agent_name":agent,
+                  "conversation_id":session}))
+PAYLOAD
+git commit -m "Synthetic $AGENT checkpoint test"
+git-ai await --timeout 30
+python3 "$SCRIPT_DIR/verify-commit-links.py" --agent "$AGENT" --repo "$REPO_DIR" \
+  --session-id-file "$RESULTS_DIR/synthetic-session-${AGENT}.txt" | tee "$LOG"

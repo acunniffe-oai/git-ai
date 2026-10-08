@@ -1,30 +1,11 @@
-use crate::authorship::authorship_log_serialization::AuthorshipLog;
-use crate::checkpoint_content_budget::CheckpointContentBudget;
+use crate::commit_links::checkpoint::LinkCheckpoint as CheckpointRequest;
 use crate::config;
 use crate::daemon::git_backend::GitBackend;
-use crate::daemon::ref_cursor::{
-    HeadReflogObservation, UntracedClaimRequest, UntracedReflogCursor, head_reflog_unchanged_since,
-    is_untraced_root_sid, observe_head_reflog,
-};
 use crate::error::GitAiError;
-use crate::git::cli_parser::{
-    ParsedGitInvocation, explicit_rebase_branch_arg, parse_git_cli_args, summarize_rebase_args,
-};
-use crate::git::find_repository_in_path;
-use crate::git::repo_state::{
-    common_dir_for_worktree, git_dir_for_worktree, worktree_belongs_to_git_dir,
-    worktree_root_for_path, worktrees_for_common_dir,
-};
-use crate::git::repository::{
-    Repository, discover_repository_in_path_no_git_exec, exec_git, exec_git_stdin,
-};
-use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
+use crate::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
+use crate::git::repo_state::{common_dir_for_worktree, worktree_root_for_path};
+use crate::git::repository::discover_repository_in_path_no_git_exec;
 use crate::utils::LockFile;
-use crate::{
-    authorship::working_log::CheckpointKind,
-    commands::checkpoint_agent::orchestrator::CheckpointRequest,
-    daemon::checkpoint::PreparedPathRole,
-};
 use futures::{StreamExt, stream};
 #[cfg(not(windows))]
 use interprocess::local_socket::ConnectOptions;
@@ -42,7 +23,7 @@ use named_pipe::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -58,9 +39,6 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 
 pub mod analyzers;
-pub mod bash_history_db;
-pub mod bash_sessions;
-pub mod checkpoint;
 pub mod control_api;
 pub mod coordinator;
 pub mod daemon_log_layer;
@@ -69,27 +47,17 @@ pub mod family_actor;
 pub mod git_backend;
 pub mod global_actor;
 pub mod health;
+mod link_checkpoints;
 mod memory_watchdog;
 pub mod reducer;
 pub mod ref_cursor;
-pub mod repo_family_store;
-pub mod rewrite_metrics;
 pub mod sentry_layer;
-pub mod stream_worker;
-pub mod sweep_coordinator;
 pub mod telemetry_handle;
 pub mod telemetry_worker;
 pub mod test_sync;
-pub mod token_usage_worker;
 pub mod trace_normalizer;
-pub mod transcript_redaction;
-pub mod untraced_commit_fixup;
-pub mod untraced_fixup_ignore;
 
-pub use control_api::{
-    BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
-    FamilyStatus, TelemetryEnvelope,
-};
+pub use control_api::{ControlRequest, ControlResponse, FamilyStatus, TelemetryEnvelope};
 
 const PID_META_FILE: &str = "daemon.pid.json";
 const TRACE_INGEST_SEQ_FIELD: &str = "git_ai_ingest_seq";
@@ -323,8 +291,6 @@ pub fn daemon_process_active() -> bool {
 struct AwaitResult {
     done: bool,
     timed_out: bool,
-    metrics_remaining: usize,
-    notes_remaining: usize,
     #[serde(default)]
     otel_remaining: usize,
     #[serde(default)]
@@ -831,193 +797,6 @@ fn trace_invocation_command_args(primary_command: Option<&str>, argv: &[String])
         .unwrap_or_default()
 }
 
-fn matches_any_pathspec(file: &str, pathspecs: &[String]) -> bool {
-    pathspecs.iter().any(|pathspec| {
-        file == pathspec
-            || (pathspec.ends_with('/') && file.starts_with(pathspec))
-            || file.starts_with(&format!("{}/", pathspec))
-    })
-}
-
-fn resolve_stash_sha(cmd: &crate::daemon::domain::NormalizedCommand) -> Option<&str> {
-    cmd.stash_target_oid.as_deref().or_else(|| {
-        cmd.ref_changes
-            .iter()
-            .find(|rc| rc.reference == "refs/stash")
-            .map(|rc| rc.old.as_str())
-            .filter(|s| !s.is_empty() && *s != "0000000000000000000000000000000000000000")
-    })
-}
-
-fn stash_base_head(repo: &Repository, stash_sha: &str) -> Option<String> {
-    repo.find_commit(stash_sha.to_string())
-        .ok()
-        .and_then(|commit| commit.parent(0).ok())
-        .map(|parent| parent.id().to_string())
-}
-
-/// After a rebase completes, check if any newly-rebased commits were created
-/// from conflict resolution with AI checkpoints. If so, merge those resolution
-/// checkpoints into the already-shifted source authorship note for the new commit.
-#[derive(Default)]
-struct RewriteMetricContext {
-    parent_by_commit: HashMap<String, String>,
-    parent_diff_by_commit: HashMap<String, crate::authorship::rewrite::DiffTreeResult>,
-}
-
-fn process_conflict_resolution_working_logs(
-    repo: &Repository,
-    new_tip: &str,
-    onto: Option<&str>,
-) -> Result<RewriteMetricContext, GitAiError> {
-    crate::wltrace::wltrace(
-        "rebase.conflict_logs",
-        &repo.workdir().unwrap_or_default(),
-        || format!("new_tip={new_tip} onto={}", onto.unwrap_or("NONE")),
-    );
-    let onto_sha = match onto {
-        Some(s) if !s.is_empty() => s,
-        _ => return Ok(RewriteMetricContext::default()),
-    };
-
-    // Walk rebased commits between onto and new_tip
-    let mut args = repo.global_args_for_exec();
-    args.extend([
-        "log".to_string(),
-        "--format=%H %P".to_string(),
-        format!("{}..{}", onto_sha, new_tip),
-    ]);
-    let output = crate::git::repository::exec_git(&args)?;
-    let log_output = String::from_utf8_lossy(&output.stdout);
-
-    let commit_parent_pairs = log_output
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            (parts.len() >= 2).then(|| (parts[0].to_string(), parts[1].to_string()))
-        })
-        .collect::<Vec<_>>();
-    let commit_shas = commit_parent_pairs
-        .iter()
-        .map(|(commit_sha, _)| commit_sha.clone())
-        .collect::<Vec<_>>();
-    let collect_metric_context = crate::authorship::rewrite::rewrite_metrics_enabled();
-    let mut metric_context = if collect_metric_context {
-        RewriteMetricContext {
-            parent_by_commit: commit_parent_pairs
-                .iter()
-                .map(|(commit_sha, parent_sha)| (commit_sha.clone(), parent_sha.clone()))
-                .collect(),
-            parent_diff_by_commit: HashMap::new(),
-        }
-    } else {
-        RewriteMetricContext::default()
-    };
-    let existing_notes = crate::git::notes_api::read_notes_batch(repo, &commit_shas)?;
-    let author = repo.effective_author_identity().formatted_or_unknown();
-
-    // Only commits whose rebased parent still has a working log incur
-    // attribution reconstruction; restrict the (expensive) parent->commit diffs
-    // to those. Compute ALL of them in ONE batched diff-tree so the per-commit
-    // loop below performs no per-commit git spawns.
-    let qualifying: Vec<&(String, String)> = commit_parent_pairs
-        .iter()
-        .filter(|(_, parent_sha)| repo.storage.has_working_log(parent_sha))
-        .collect();
-    let diff_pairs: Vec<(String, String)> = qualifying
-        .iter()
-        .map(|(commit_sha, parent_sha)| (parent_sha.clone(), commit_sha.clone()))
-        .collect();
-    let diff_results = if diff_pairs.is_empty() {
-        Vec::new()
-    } else {
-        crate::authorship::rewrite::compute_diff_trees_batch(repo, &diff_pairs)?
-    };
-    let diff_by_commit: HashMap<&str, &crate::authorship::rewrite::DiffTreeResult> = qualifying
-        .iter()
-        .zip(diff_results.iter())
-        .map(|((commit_sha, _), result)| (commit_sha.as_str(), result))
-        .collect();
-    if collect_metric_context {
-        metric_context.parent_diff_by_commit = qualifying
-            .iter()
-            .zip(diff_results.iter())
-            .map(|((commit_sha, _), result)| (commit_sha.clone(), result.clone()))
-            .collect();
-    }
-
-    for (commit_sha, parent_sha) in &commit_parent_pairs {
-        let existing_shifted_log = existing_notes
-            .get(commit_sha)
-            .and_then(|raw| AuthorshipLog::deserialize_from_string(raw).ok());
-        post_conflict_resolution_working_log(
-            repo,
-            parent_sha,
-            commit_sha,
-            author.clone(),
-            existing_shifted_log,
-            diff_by_commit.get(commit_sha.as_str()).copied(),
-        )?;
-    }
-    Ok(metric_context)
-}
-
-fn rewrite_metric_commits_with_context(
-    metric_commits: Vec<crate::authorship::rewrite::RewriteMetricCommit>,
-    context: RewriteMetricContext,
-) -> Vec<crate::authorship::rewrite::RewriteMetricCommit> {
-    metric_commits
-        .into_iter()
-        .map(|mut commit| {
-            if let Some(parent_sha) = context.parent_by_commit.get(&commit.new_sha) {
-                commit = commit.with_parent_sha(parent_sha.clone());
-            }
-            if let Some(diff) = context.parent_diff_by_commit.get(&commit.new_sha) {
-                commit = commit.with_parent_diff(diff.clone());
-            }
-            commit
-        })
-        .collect()
-}
-
-fn post_conflict_resolution_working_log(
-    repo: &Repository,
-    parent_sha: &str,
-    commit_sha: &str,
-    author: String,
-    existing_shifted_log: Option<AuthorshipLog>,
-    precomputed_parent_diff: Option<&crate::authorship::rewrite::DiffTreeResult>,
-) -> Result<(), GitAiError> {
-    if !repo.storage.has_working_log(parent_sha) {
-        return Ok(());
-    }
-
-    let commit_for_transform = commit_sha.to_string();
-    crate::authorship::post_commit::post_commit_from_working_log_with_transform_options_and_diff(
-        repo,
-        Some(parent_sha.to_string()),
-        commit_sha.to_string(),
-        author,
-        crate::authorship::post_commit::PostCommitOptions {
-            supress_output: true,
-            compute_stats: false,
-            recover_attribution: false,
-            commit_source: None,
-        },
-        precomputed_parent_diff,
-        move |resolution_log| {
-            Ok(
-                crate::authorship::conflict_resolution::merge_conflict_resolution_authorship(
-                    existing_shifted_log,
-                    resolution_log,
-                    &commit_for_transform,
-                ),
-            )
-        },
-    )
-    .map(|_| ())
-}
-
 fn rfc3339_to_unix_nanos(value: &str) -> Option<u128> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -1062,217 +841,6 @@ fn wait_at_checkpoint_test_barrier(trace_id: &str) -> Result<(), GitAiError> {
     )))
 }
 
-fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), GitAiError> {
-    #[cfg(feature = "test-support")]
-    {
-        wait_at_checkpoint_test_barrier(&request.trace_id)?;
-        if let Some(delay) = checkpoint_test_delay(
-            "GIT_AI_TEST_DELAY_CHECKPOINT_SIDE_EFFECT",
-            &request.trace_id,
-        ) {
-            std::thread::sleep(delay);
-        }
-        if std::env::var("GIT_AI_TEST_FAIL_CHECKPOINT_SIDE_EFFECT")
-            .is_ok_and(|trace_id| trace_id == request.trace_id)
-        {
-            return Err(GitAiError::Generic(
-                "synthetic checkpoint processing failure".to_string(),
-            ));
-        }
-    }
-
-    if request.files.is_empty() {
-        return Ok(());
-    }
-
-    if request.checkpoint_kind.is_ai()
-        && let Some(agent_id) = request.agent_id.as_mut()
-    {
-        crate::streams::model_extraction::enrich_copilot_agent_model(agent_id, &request.metadata);
-    }
-
-    let repo_work_dir = &request.files[0].repo_work_dir;
-    let repo = match discover_repository_in_path_no_git_exec(repo_work_dir) {
-        Ok(repo) => repo,
-        Err(e) => {
-            if request.checkpoint_kind.is_ai()
-                && let Some(ref agent_id) = request.agent_id
-                && crate::daemon::checkpoint::should_emit_agent_usage(agent_id)
-            {
-                let attrs = crate::daemon::checkpoint::build_agent_usage_attrs(None, agent_id);
-                let values = crate::metrics::AgentUsageValues::new();
-                crate::metrics::record(values, attrs);
-            }
-            return Err(e);
-        }
-    };
-    let author = repo.effective_author_identity().formatted_or_unknown();
-
-    if request.checkpoint_kind.is_ai()
-        && let Some(ref agent_id) = request.agent_id
-        && crate::daemon::checkpoint::should_emit_agent_usage(agent_id)
-    {
-        let attrs = crate::daemon::checkpoint::build_agent_usage_attrs(Some(&repo), agent_id);
-        let values = crate::metrics::AgentUsageValues::new();
-        crate::metrics::record(values, attrs);
-    }
-
-    let resolved = resolve_checkpoint_request(&repo, &mut request)?;
-    let Some(resolved) = resolved else {
-        return Ok(());
-    };
-
-    crate::daemon::checkpoint::execute_resolved_checkpoint_from_daemon(
-        &repo,
-        &author,
-        request.checkpoint_kind,
-        request,
-        resolved,
-    )
-}
-
-fn resolve_checkpoint_request(
-    repo: &crate::git::repository::Repository,
-    request: &mut CheckpointRequest,
-) -> Result<Option<crate::daemon::checkpoint::ResolvedCheckpointExecution>, GitAiError> {
-    use crate::authorship::ignore::{
-        build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
-    };
-    use crate::commands::checkpoint_agent::orchestrator::BaseCommit;
-    use crate::utils::normalize_to_posix;
-
-    let Some(first_file) = request.files.first() else {
-        return Ok(None);
-    };
-    let base_commit = match &first_file.base_commit {
-        BaseCommit::Sha(sha) => sha.clone(),
-        BaseCommit::Initial => "initial".to_string(),
-    };
-
-    let repo_workdir = repo.workdir()?;
-    let canonical_workdir = repo_workdir.canonicalize().unwrap_or(repo_workdir.clone());
-    let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
-    let ignore_matcher = build_ignore_matcher(&ignore_patterns);
-
-    let mut files = Vec::new();
-    let mut dirty_files: HashMap<String, Arc<str>> = HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    let config = config::Config::fresh();
-    let mut content_budget = CheckpointContentBudget::from_config(&config);
-
-    for file in &mut request.files {
-        let path_str = file.path.to_string_lossy();
-        let path_str = path_str.trim();
-        if path_str.is_empty() {
-            continue;
-        }
-
-        let abs_path = if file.path.is_absolute() {
-            file.path.clone()
-        } else {
-            repo_workdir.join(&*file.path)
-        };
-        if !repo.path_is_in_workdir(&abs_path) {
-            continue;
-        }
-
-        let relative_path = abs_path
-            .canonicalize()
-            .unwrap_or(abs_path.clone())
-            .strip_prefix(&canonical_workdir)
-            .map(|p| normalize_to_posix(&p.to_string_lossy()))
-            .unwrap_or_else(|_| {
-                abs_path
-                    .strip_prefix(&repo_workdir)
-                    .map(|p| normalize_to_posix(&p.to_string_lossy()))
-                    .unwrap_or_else(|_| normalize_to_posix(path_str))
-            });
-
-        if !seen.insert(relative_path.clone()) {
-            continue;
-        }
-        if should_ignore_file_with_matcher(&relative_path, &ignore_matcher) {
-            continue;
-        }
-
-        if let Some(content) = std::mem::take(&mut file.content) {
-            if content.as_bytes().contains(&0) {
-                continue;
-            }
-            if !content_budget.reserve(&relative_path, &content) {
-                continue;
-            }
-            dirty_files.insert(relative_path.clone(), Arc::from(content));
-            files.push(relative_path);
-        }
-    }
-
-    if files.is_empty() {
-        return Ok(None);
-    }
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-
-    Ok(Some(
-        crate::daemon::checkpoint::ResolvedCheckpointExecution {
-            base_commit,
-            ts,
-            files,
-            dirty_files,
-        },
-    ))
-}
-
-fn compute_watermarks_from_stat(
-    repo_working_dir: &str,
-    file_paths: &[String],
-) -> std::collections::HashMap<String, u128> {
-    let repo_root = std::path::Path::new(repo_working_dir);
-    let mut watermarks = std::collections::HashMap::new();
-    for path in file_paths {
-        let full_path = repo_root.join(path);
-        if let Ok(metadata) = std::fs::symlink_metadata(&full_path)
-            && let Ok(mtime) = metadata.modified()
-        {
-            let nanos = mtime
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            // Normalize watermark keys the same way bash_tool::normalize_path does
-            // so that case-folded snapshot lookups on macOS/Windows find a match.
-            let key = crate::commands::checkpoint_agent::bash_tool::normalize_path(
-                std::path::Path::new(path),
-            )
-            .to_string_lossy()
-            .to_string();
-            watermarks.insert(key, nanos);
-        }
-    }
-    watermarks
-}
-
-fn capture_commit_file_timestamps(
-    worktree: &Path,
-    commit_sha: &str,
-) -> Result<crate::authorship::attribution_recovery::FileTimestampsByPath, GitAiError> {
-    let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-    let workdir = repo.workdir()?;
-    let files = repo.list_commit_files(commit_sha, None)?;
-    let mut timestamps_by_path = HashMap::new();
-    for file_path in files {
-        let timestamps = crate::authorship::attribution_recovery::file_timestamps_for_path(
-            &workdir.join(&file_path),
-        );
-        if !timestamps.is_empty() {
-            timestamps_by_path.insert(file_path, timestamps);
-        }
-    }
-    Ok(timestamps_by_path)
-}
-
 fn parsed_invocation_for_side_effect(
     command: Option<&str>,
     args: &[String],
@@ -1307,1019 +875,6 @@ fn parsed_invocation_for_normalized_command(
         saw_end_of_opts: false,
         is_help: false,
     }
-}
-
-fn apply_push_side_effect(
-    worktree: &str,
-    command: Option<&str>,
-    args: &[String],
-) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
-    use crate::git::cli_parser::is_dry_run;
-    use crate::git::sync_authorship::{push_authorship_notes, push_remote_from_args};
-
-    if crate::config::Config::get().notes_backend_kind() == NotesBackendKind::Http {
-        tracing::debug!("apply_push_side_effect: skipping authorship push (Http backend)");
-        return Ok(());
-    }
-
-    let repo = find_repository_in_path(worktree)?;
-    let parsed = parsed_invocation_for_side_effect(command, args);
-
-    if is_dry_run(&parsed.command_args)
-        || parsed
-            .command_args
-            .iter()
-            .any(|a| a == "-d" || a == "--delete")
-        || parsed.command_args.iter().any(|a| a == "--mirror")
-    {
-        return Ok(());
-    }
-
-    let remote = push_remote_from_args(&repo, &parsed)?;
-
-    crate::commands::upgrade::maybe_schedule_background_update_check();
-    tracing::debug!("started pushing authorship notes to remote: {}", remote);
-
-    push_authorship_notes(&repo, &remote)
-}
-
-fn transcript_sweep_triggers_for_events(
-    events: &[crate::daemon::domain::SemanticEvent],
-) -> Vec<crate::daemon::stream_worker::SweepTrigger> {
-    let mut triggers = Vec::new();
-
-    if events.iter().any(|event| {
-        matches!(
-            event,
-            crate::daemon::domain::SemanticEvent::CommitCreated { .. }
-                | crate::daemon::domain::SemanticEvent::CommitAmended { .. }
-        )
-    }) {
-        triggers.push(crate::daemon::stream_worker::SweepTrigger::PostCommit);
-    }
-
-    if events.iter().any(|event| {
-        matches!(
-            event,
-            crate::daemon::domain::SemanticEvent::PushCompleted { .. }
-        )
-    }) {
-        triggers.push(crate::daemon::stream_worker::SweepTrigger::PostPush);
-    }
-
-    triggers
-}
-
-fn apply_pull_notes_sync_side_effect(
-    worktree: &str,
-    command: Option<&str>,
-    args: &[String],
-) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
-
-    let repo = find_repository_in_path(worktree)?;
-    let parsed = parsed_invocation_for_side_effect(command, args);
-    let remote = fetch_remote_from_args(&repo, &parsed)?;
-    let notes_backend = crate::config::Config::fresh().notes_backend_kind();
-
-    tracing::info!(
-        command = command.unwrap_or("pull"),
-        remote = %remote,
-        backend = %notes_backend,
-        worktree = %worktree,
-        "handling pull notes sync"
-    );
-
-    if notes_backend == NotesBackendKind::Http {
-        return crate::git::notes_api::warm_cache_for_remote(&repo, &remote);
-    }
-
-    fetch_authorship_notes(&repo, &remote)?;
-    Ok(())
-}
-
-fn apply_clone_notes_sync_side_effect(worktree: &str) -> Result<(), GitAiError> {
-    use crate::config::NotesBackendKind;
-
-    let repo = find_repository_in_path(worktree)?;
-    let remote = "origin";
-    let notes_backend = crate::config::Config::fresh().notes_backend_kind();
-
-    tracing::info!(
-        command = "clone",
-        remote = %remote,
-        backend = %notes_backend,
-        worktree = %worktree,
-        "handling clone notes sync"
-    );
-
-    if notes_backend == NotesBackendKind::Http {
-        return crate::git::notes_api::warm_cache_for_remote(&repo, remote);
-    }
-
-    fetch_authorship_notes(&repo, remote)?;
-    Ok(())
-}
-
-fn apply_pull_fast_forward_working_log_side_effect(
-    worktree: &str,
-    old_head: &str,
-    new_head: &str,
-) -> Result<(), GitAiError> {
-    let repo = find_repository_in_path(worktree)?;
-    repo.storage.rename_working_log(old_head, new_head)?;
-    Ok(())
-}
-
-fn remove_working_log_attributions_for_pathspecs(
-    repository: &Repository,
-    head: &str,
-    pathspecs: &[String],
-) -> Result<(), GitAiError> {
-    let working_log = repository.storage.working_log_for_base_commit(head)?;
-
-    let initial = working_log.read_initial_attributions();
-    if !initial.files.is_empty() {
-        let filtered_files = initial
-            .files
-            .into_iter()
-            .filter(|(file, _)| !matches_any_pathspec(file, pathspecs))
-            .collect();
-        let mut filtered_blobs = initial.file_blobs;
-        filtered_blobs.retain(|file, _| !matches_any_pathspec(file, pathspecs));
-        working_log.write_initial(crate::git::repo_storage::InitialAttributions {
-            files: filtered_files,
-            prompts: initial.prompts,
-            file_blobs: filtered_blobs,
-            humans: initial.humans,
-            sessions: initial.sessions,
-        })?;
-    }
-
-    let checkpoints = working_log.read_all_checkpoints()?;
-    let filtered: Vec<_> = checkpoints
-        .into_iter()
-        .map(|mut checkpoint| {
-            checkpoint
-                .entries
-                .retain(|entry| !matches_any_pathspec(&entry.file, pathspecs));
-            checkpoint
-        })
-        .filter(|checkpoint| !checkpoint.entries.is_empty())
-        .collect();
-    working_log.write_all_checkpoints(&filtered)?;
-    Ok(())
-}
-
-fn apply_checkout_switch_working_log_side_effect(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Result<(), GitAiError> {
-    let Some(worktree) = cmd.worktree.as_ref() else {
-        return Ok(());
-    };
-    let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-    let parsed = parsed_invocation_for_normalized_command(cmd);
-    let (old_head, new_head) = ActorDaemonCoordinator::resolve_heads_for_command(cmd);
-
-    if cmd.primary_command.as_deref() == Some("checkout") {
-        let pathspecs = parsed.pathspecs();
-        if !pathspecs.is_empty() {
-            if !old_head.is_empty() {
-                remove_working_log_attributions_for_pathspecs(&repo, &old_head, &pathspecs)?;
-            }
-            return Ok(());
-        }
-    }
-
-    if old_head.is_empty() || new_head.is_empty() || old_head == new_head {
-        return Ok(());
-    }
-
-    let is_merge = parsed.has_command_flag("--merge") || parsed.has_command_flag("-m");
-    let is_force = match cmd.primary_command.as_deref() {
-        Some("checkout") => parsed.has_command_flag("--force") || parsed.has_command_flag("-f"),
-        Some("switch") => {
-            parsed.has_command_flag("--discard-changes")
-                || parsed.has_command_flag("--force")
-                || parsed.has_command_flag("-f")
-        }
-        _ => false,
-    };
-
-    if is_force {
-        repo.storage.delete_working_log_for_base_commit(&old_head)?;
-        return Ok(());
-    }
-
-    if is_merge {
-        let final_state =
-            crate::authorship::virtual_attribution::checkout_merge_final_state_snapshot(
-                &repo, &old_head, &new_head,
-            )?;
-        if final_state.is_empty() {
-            repo.storage.delete_working_log_for_base_commit(&old_head)?;
-            return Ok(());
-        }
-        let author = repo.effective_author_identity().formatted_or_unknown();
-        crate::authorship::virtual_attribution::restore_working_log_carryover(
-            &repo,
-            &old_head,
-            &new_head,
-            final_state,
-            Some(author),
-        )?;
-        repo.storage.delete_working_log_for_base_commit(&old_head)?;
-        return Ok(());
-    }
-
-    repo.storage.rename_working_log(&old_head, &new_head)?;
-    Ok(())
-}
-
-fn recent_checkout_switch_prerequisite_from_command(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Option<RecentReplayPrerequisite> {
-    let parsed = parsed_invocation_for_normalized_command(cmd);
-    let (old_head, new_head) = ActorDaemonCoordinator::resolve_heads_for_command(cmd);
-
-    if old_head.is_empty() || new_head.is_empty() || old_head == new_head {
-        return None;
-    }
-
-    if cmd.primary_command.as_deref() == Some("checkout") && !parsed.pathspecs().is_empty() {
-        return None;
-    }
-
-    let is_force = match cmd.primary_command.as_deref() {
-        Some("checkout") => parsed.has_command_flag("--force") || parsed.has_command_flag("-f"),
-        Some("switch") => {
-            parsed.has_command_flag("--discard-changes")
-                || parsed.has_command_flag("--force")
-                || parsed.has_command_flag("-f")
-        }
-        _ => false,
-    };
-    if is_force {
-        return None;
-    }
-
-    let is_merge = parsed.has_command_flag("--merge") || parsed.has_command_flag("-m");
-    if is_merge {
-        return None;
-    }
-
-    Some(RecentReplayPrerequisite::CheckoutSwitchRename {
-        target_head: new_head,
-        old_head,
-    })
-}
-fn family_key_for_repository(repo: &Repository) -> String {
-    repo.common_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| repo.common_dir().to_path_buf())
-        .to_string_lossy()
-        .to_string()
-}
-fn is_valid_oid(oid: &str) -> bool {
-    matches!(oid.len(), 40 | 64) && oid.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn is_zero_oid(oid: &str) -> bool {
-    is_valid_oid(oid) && oid.chars().all(|c| c == '0')
-}
-
-fn is_non_auxiliary_ref(reference: &str) -> bool {
-    !(reference.starts_with("refs/notes/")
-        || reference.starts_with("refs/tags/")
-        || reference.starts_with("refs/replace/"))
-}
-
-/// Check whether `ancestor` is an ancestor of `descendant` using
-/// `git merge-base --is-ancestor`.
-fn is_ancestor_commit(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    crate::git::repository::exec_git(&args).is_ok()
-}
-
-fn repo_is_ancestor(
-    repository: &crate::git::repository::Repository,
-    ancestor: &str,
-    descendant: &str,
-) -> bool {
-    let mut args = repository.global_args_for_exec();
-    args.push("merge-base".to_string());
-    args.push("--is-ancestor".to_string());
-    args.push(ancestor.to_string());
-    args.push(descendant.to_string());
-    exec_git(&args).is_ok()
-}
-
-fn rebase_is_control_mode(cmd: &crate::daemon::domain::NormalizedCommand) -> bool {
-    summarize_rebase_args(&cmd.invoked_args).is_control_mode
-}
-
-fn rebase_onto_from_command(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    repository: &Repository,
-    original_head: &str,
-    new_tip: &str,
-) -> Option<String> {
-    let head_changes = cmd
-        .ref_changes
-        .iter()
-        .filter(|change| {
-            change.reference == "HEAD"
-                && is_valid_oid(&change.old)
-                && !is_zero_oid(&change.old)
-                && is_valid_oid(&change.new)
-                && !is_zero_oid(&change.new)
-                && change.old != change.new
-        })
-        .collect::<Vec<_>>();
-
-    head_changes
-        .iter()
-        .find(|change| {
-            change.old == original_head
-                && change.new != original_head
-                && change.new != new_tip
-                && is_ancestor_commit(repository, &change.new, new_tip)
-        })
-        .map(|change| change.new.clone())
-        .or_else(|| {
-            head_changes
-                .iter()
-                .find(|change| {
-                    change.old != original_head
-                        && change.old != new_tip
-                        && is_ancestor_commit(repository, &change.old, new_tip)
-                })
-                .map(|change| change.old.clone())
-        })
-}
-
-fn valid_non_zero_ref_change(change: &crate::daemon::domain::RefChange) -> bool {
-    is_valid_oid(&change.old)
-        && !is_zero_oid(&change.old)
-        && is_valid_oid(&change.new)
-        && !is_zero_oid(&change.new)
-        && change.old != change.new
-}
-
-fn rewrite_metric_branch_for_ref(reference: &str) -> Option<String> {
-    crate::authorship::rewrite::branch_name_from_ref(reference)
-}
-
-fn rewrite_metric_branch_for_transition(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    old_tip: &str,
-    new_tip: &str,
-    reference_hint: Option<&str>,
-) -> Option<String> {
-    reference_hint
-        .and_then(rewrite_metric_branch_for_ref)
-        .or_else(|| {
-            cmd.ref_changes
-                .iter()
-                .rev()
-                .find(|change| {
-                    change.reference.starts_with("refs/heads/")
-                        && change.old == old_tip
-                        && change.new == new_tip
-                })
-                .and_then(|change| rewrite_metric_branch_for_ref(&change.reference))
-        })
-}
-
-fn rewrite_metric_commits_with_branch(
-    metric_commits: Vec<crate::authorship::rewrite::RewriteMetricCommit>,
-    branch: Option<String>,
-) -> Vec<crate::authorship::rewrite::RewriteMetricCommit> {
-    match branch {
-        Some(branch) => metric_commits
-            .into_iter()
-            .map(|commit| commit.with_branch(branch.clone()))
-            .collect(),
-        None => metric_commits,
-    }
-}
-
-fn rebase_new_tip_from_command(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    original_head: &str,
-) -> Option<String> {
-    if let Some(new_tip) = cmd
-        .ref_changes
-        .iter()
-        .rev()
-        .find(|change| {
-            change.reference.starts_with("refs/heads/")
-                && valid_non_zero_ref_change(change)
-                && change.old == original_head
-        })
-        .map(|change| change.new.clone())
-    {
-        return Some(new_tip);
-    }
-
-    if !rebase_is_control_mode(cmd) {
-        return None;
-    }
-
-    let branch_ref_names = cmd
-        .ref_changes
-        .iter()
-        .filter(|change| {
-            change.reference.starts_with("refs/heads/") && valid_non_zero_ref_change(change)
-        })
-        .map(|change| change.reference.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    if branch_ref_names.len() == 1
-        && let Some(new_tip) = cmd
-            .ref_changes
-            .iter()
-            .rev()
-            .find(|change| {
-                change.reference.starts_with("refs/heads/") && valid_non_zero_ref_change(change)
-            })
-            .map(|change| change.new.clone())
-    {
-        return Some(new_tip);
-    }
-
-    cmd.ref_changes
-        .iter()
-        .rev()
-        .find(|change| change.reference == "HEAD" && valid_non_zero_ref_change(change))
-        .map(|change| change.new.clone())
-}
-
-fn cherry_pick_destination_commits(cmd: &crate::daemon::domain::NormalizedCommand) -> Vec<String> {
-    cmd.ref_changes
-        .iter()
-        .filter(|change| change.reference == "HEAD")
-        .filter(|change| {
-            is_valid_oid(&change.old)
-                && !is_zero_oid(&change.old)
-                && is_valid_oid(&change.new)
-                && !is_zero_oid(&change.new)
-                && change.old != change.new
-        })
-        .map(|change| change.new.clone())
-        .collect()
-}
-
-fn first_head_transition_old(cmd: &crate::daemon::domain::NormalizedCommand) -> Option<String> {
-    cmd.ref_changes
-        .iter()
-        .find(|change| {
-            change.reference == "HEAD"
-                && is_valid_oid(&change.old)
-                && !is_zero_oid(&change.old)
-                && is_valid_oid(&change.new)
-                && !is_zero_oid(&change.new)
-                && change.old != change.new
-        })
-        .map(|change| change.old.clone())
-}
-
-fn cherry_pick_original_head(cmd: &crate::daemon::domain::NormalizedCommand) -> Option<String> {
-    first_head_transition_old(cmd)
-}
-
-fn revert_original_head(cmd: &crate::daemon::domain::NormalizedCommand) -> Option<String> {
-    first_head_transition_old(cmd)
-}
-
-fn cherry_pick_source_args_for_side_effect(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Vec<String> {
-    let parsed = parsed_invocation_for_normalized_command(cmd);
-    if parsed.command.as_deref() != Some("cherry-pick")
-        && cmd.primary_command.as_deref() != Some("cherry-pick")
-    {
-        return Vec::new();
-    }
-
-    cherry_pick_source_args_from_command_args(&parsed.command_args)
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn cherry_pick_command_has_flag(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    flag: &str,
-) -> bool {
-    let parsed = parsed_invocation_for_normalized_command(cmd);
-    if parsed.command.as_deref() != Some("cherry-pick")
-        && cmd.primary_command.as_deref() != Some("cherry-pick")
-    {
-        return false;
-    }
-
-    parsed.command_args.iter().any(|arg| arg == flag)
-}
-
-fn cherry_pick_source_args_from_command_args(args: &[String]) -> Vec<&str> {
-    let mut sources = Vec::new();
-    let mut idx = 0usize;
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        if arg == "--" {
-            sources.extend(args[idx + 1..].iter().map(String::as_str));
-            break;
-        }
-        if matches!(arg, "--abort" | "--continue" | "--quit" | "--skip") {
-            return Vec::new();
-        }
-        if matches!(
-            arg,
-            "-m" | "--mainline" | "-X" | "--strategy-option" | "--strategy"
-        ) {
-            idx = idx.saturating_add(2);
-            continue;
-        }
-        if arg.starts_with("--mainline=")
-            || arg.starts_with("--strategy=")
-            || arg.starts_with("--strategy-option=")
-            || arg == "--gpg-sign"
-            || arg.starts_with("--gpg-sign=")
-            || arg.starts_with("-m")
-            || arg.starts_with("-X")
-            || arg.starts_with("-S")
-        {
-            idx += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            idx += 1;
-            continue;
-        }
-        if !arg.is_empty() {
-            sources.push(arg);
-        }
-        idx += 1;
-    }
-    sources
-}
-
-fn cherry_pick_source_is_range(source: &str) -> bool {
-    source.contains("..")
-}
-
-fn cherry_pick_range_has_omitted_side(source: &str) -> bool {
-    if let Some((left, right)) = source.split_once("...") {
-        left.is_empty() || right.is_empty()
-    } else if let Some((left, right)) = source.split_once("..") {
-        left.is_empty() || right.is_empty()
-    } else {
-        false
-    }
-}
-
-fn resolve_cherry_pick_source_args_with_git_in_head_context(
-    repo: &Repository,
-    source_args: &[String],
-    head_context: Option<&str>,
-) -> Result<Vec<String>, GitAiError> {
-    let mut resolved = Vec::new();
-    let mut seen = HashSet::new();
-
-    for source in source_args {
-        let source = head_context
-            .map(|head| rewrite_head_source_arg_for_side_effect(source, head))
-            .unwrap_or_else(|| source.clone());
-        let oids = if cherry_pick_source_is_range(&source) {
-            if cherry_pick_range_has_omitted_side(&source) {
-                Vec::new()
-            } else {
-                resolve_cherry_pick_range_source_with_git(repo, &source)?
-            }
-        } else {
-            resolve_cherry_pick_single_source_with_git(repo, &source)?
-        };
-
-        for oid in oids {
-            if seen.insert(oid.clone()) {
-                resolved.push(oid);
-            }
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn rewrite_head_source_arg_for_side_effect(source: &str, head_context: &str) -> String {
-    if head_context.is_empty() || !is_valid_oid(head_context) {
-        return source.to_string();
-    }
-    if let Some((left, right)) = source.split_once("...") {
-        return format!(
-            "{}...{}",
-            rewrite_head_source_term_for_side_effect(left, head_context),
-            rewrite_head_source_term_for_side_effect(right, head_context)
-        );
-    }
-    if let Some((left, right)) = source.split_once("..") {
-        return format!(
-            "{}..{}",
-            rewrite_head_source_term_for_side_effect(left, head_context),
-            rewrite_head_source_term_for_side_effect(right, head_context)
-        );
-    }
-    rewrite_head_source_term_for_side_effect(source, head_context)
-}
-
-fn rewrite_head_source_term_for_side_effect(term: &str, head_context: &str) -> String {
-    if term == "HEAD" || term == "@" {
-        return head_context.to_string();
-    }
-    if let Some(suffix) = term.strip_prefix("HEAD")
-        && (suffix.starts_with('~') || suffix.starts_with('^'))
-    {
-        return format!("{head_context}{suffix}");
-    }
-    if let Some(suffix) = term.strip_prefix('@')
-        && (suffix.starts_with('~') || suffix.starts_with('^'))
-    {
-        return format!("{head_context}{suffix}");
-    }
-    term.to_string()
-}
-
-fn resolve_cherry_pick_single_source_with_git(
-    repo: &Repository,
-    source: &str,
-) -> Result<Vec<String>, GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.extend([
-        "cat-file".to_string(),
-        "--batch-check=%(objectname) %(objecttype)".to_string(),
-    ]);
-    let stdin_data = format!("{source}^{{commit}}\n");
-    let output = exec_git_stdin(&args, stdin_data.as_bytes())?;
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let oid = parts.next()?;
-            (parts.next() == Some("commit") && is_valid_oid(oid)).then(|| oid.to_string())
-        })
-        .collect())
-}
-
-fn resolve_cherry_pick_range_source_with_git(
-    repo: &Repository,
-    source: &str,
-) -> Result<Vec<String>, GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.extend([
-        "rev-list".to_string(),
-        "--reverse".to_string(),
-        source.to_string(),
-    ]);
-    let output = exec_git(&args)?;
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| is_valid_oid(line))
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn resolve_explicit_cherry_pick_sources_for_side_effect(
-    repo: &Repository,
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Result<Vec<String>, GitAiError> {
-    let source_args = cherry_pick_source_args_for_side_effect(cmd);
-    if source_args.is_empty() {
-        return Ok(Vec::new());
-    }
-    let original_head = cherry_pick_original_head(cmd);
-    resolve_cherry_pick_source_args_with_git_in_head_context(
-        repo,
-        &source_args,
-        original_head.as_deref(),
-    )
-}
-
-fn revert_source_args_for_side_effect(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Vec<String> {
-    let parsed = parsed_invocation_for_normalized_command(cmd);
-    if parsed.command.as_deref() != Some("revert")
-        && cmd.primary_command.as_deref() != Some("revert")
-    {
-        return Vec::new();
-    }
-
-    revert_source_args_from_command_args(&parsed.command_args)
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn revert_source_args_from_command_args(args: &[String]) -> Vec<&str> {
-    let args = if args.first().is_some_and(|arg| arg == "revert") {
-        &args[1..]
-    } else {
-        args
-    };
-    let mut sources = Vec::new();
-    let mut idx = 0usize;
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        if arg == "--" {
-            sources.extend(args[idx + 1..].iter().map(String::as_str));
-            break;
-        }
-        if matches!(arg, "--abort" | "--continue" | "--quit" | "--skip") {
-            return Vec::new();
-        }
-        if matches!(arg, "-m" | "--mainline") {
-            idx = idx.saturating_add(2);
-            continue;
-        }
-        if arg.starts_with("--mainline=")
-            || arg == "--gpg-sign"
-            || arg.starts_with("--gpg-sign=")
-            || arg.starts_with("-S")
-        {
-            idx += 1;
-            continue;
-        }
-        if matches!(arg, "-n" | "--no-commit" | "--no-edit" | "-e" | "--edit") {
-            idx += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            idx += 1;
-            continue;
-        }
-        if !arg.is_empty() {
-            sources.push(arg);
-        }
-        idx += 1;
-    }
-    sources
-}
-
-fn resolve_explicit_revert_sources_for_side_effect(
-    repo: &Repository,
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Result<Vec<String>, GitAiError> {
-    let source_args = revert_source_args_for_side_effect(cmd);
-    if source_args.is_empty() {
-        return Ok(Vec::new());
-    }
-    let original_head = revert_original_head(cmd);
-    resolve_cherry_pick_source_args_with_git_in_head_context(
-        repo,
-        &source_args,
-        original_head.as_deref(),
-    )
-}
-
-fn cherry_pick_state_exists_for_worktree(worktree: &Path) -> bool {
-    git_dir_for_worktree(worktree).is_some_and(|git_dir| {
-        git_dir.join("CHERRY_PICK_HEAD").exists() || git_dir.join("sequencer").join("todo").exists()
-    })
-}
-
-fn revert_destination_changes(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-) -> Vec<&crate::daemon::domain::RefChange> {
-    cmd.ref_changes
-        .iter()
-        .filter(|change| {
-            change.reference == "HEAD"
-                && is_valid_oid(&change.old)
-                && !is_zero_oid(&change.old)
-                && is_valid_oid(&change.new)
-                && !is_zero_oid(&change.new)
-                && change.old != change.new
-        })
-        .collect()
-}
-
-fn apply_revert_complete_rewrite(
-    repo: &crate::git::repository::Repository,
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    source_oids: &[String],
-) -> Result<(), GitAiError> {
-    let specs: Vec<crate::authorship::rewrite_revert::RevertSpec> = revert_destination_changes(cmd)
-        .into_iter()
-        .enumerate()
-        .map(
-            |(index, change)| crate::authorship::rewrite_revert::RevertSpec {
-                revert_commit: change.new.clone(),
-                parent: Some(change.old.clone()),
-                reverted_commit: source_oids.get(index).cloned(),
-            },
-        )
-        .collect();
-    let metric_commits =
-        crate::authorship::rewrite_revert::handle_revert_commits_with_metrics(repo, &specs)?;
-    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, metric_commits);
-    Ok(())
-}
-
-fn apply_cherry_pick_complete_rewrite(
-    repo: &crate::git::repository::Repository,
-    original_head: &str,
-    sources: &[String],
-    new_commits: &[String],
-) -> Result<(), GitAiError> {
-    let pairs = crate::authorship::rewrite_cherry_pick::match_cherry_pick_pairs(
-        repo,
-        sources,
-        new_commits,
-    )?;
-    let mut rewrite_metric_commits = Vec::new();
-    if !pairs.is_empty() {
-        let (src, dst): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-        let outcome = crate::authorship::rewrite::handle_rewrite_event_with_metrics(
-            repo,
-            crate::authorship::rewrite::RewriteEvent::CherryPickComplete {
-                sources: src,
-                new_commits: dst,
-            },
-        )?;
-        rewrite_metric_commits.extend(outcome.metric_commits);
-    }
-
-    let existing_notes = crate::git::notes_api::read_notes_batch(repo, new_commits)?;
-    let author = repo.effective_author_identity().formatted_or_unknown();
-
-    // The cherry-picked commits form a chain: each commit's parent is the
-    // previous one (the first's parent is original_head). Build the
-    // (commit, parent) pairs, then batch the parent->commit diffs for the
-    // commits that actually need reconstruction into ONE diff-tree so the loop
-    // performs no per-commit git spawns.
-    let mut commit_parent_pairs: Vec<(String, String)> = Vec::new();
-    let mut parent = original_head.to_string();
-    for commit_sha in new_commits {
-        commit_parent_pairs.push((commit_sha.clone(), parent.clone()));
-        parent = commit_sha.clone();
-    }
-    let qualifying: Vec<&(String, String)> = commit_parent_pairs
-        .iter()
-        .filter(|(_, parent_sha)| repo.storage.has_working_log(parent_sha))
-        .collect();
-    let diff_pairs: Vec<(String, String)> = qualifying
-        .iter()
-        .map(|(commit_sha, parent_sha)| (parent_sha.clone(), commit_sha.clone()))
-        .collect();
-    let diff_results = if diff_pairs.is_empty() {
-        Vec::new()
-    } else {
-        crate::authorship::rewrite::compute_diff_trees_batch(repo, &diff_pairs)?
-    };
-    let diff_by_commit: HashMap<&str, &crate::authorship::rewrite::DiffTreeResult> = qualifying
-        .iter()
-        .zip(diff_results.iter())
-        .map(|((commit_sha, _), result)| (commit_sha.as_str(), result))
-        .collect();
-
-    for (commit_sha, parent_sha) in &commit_parent_pairs {
-        let existing_shifted_log = existing_notes
-            .get(commit_sha)
-            .and_then(|raw| AuthorshipLog::deserialize_from_string(raw).ok());
-        post_conflict_resolution_working_log(
-            repo,
-            parent_sha,
-            commit_sha,
-            author.clone(),
-            existing_shifted_log,
-            diff_by_commit.get(commit_sha.as_str()).copied(),
-        )?;
-    }
-
-    let rewrite_metric_commits = if rewrite_metric_commits.is_empty() {
-        rewrite_metric_commits
-    } else {
-        let parent_by_commit: HashMap<&str, &str> = commit_parent_pairs
-            .iter()
-            .map(|(commit_sha, parent_sha)| (commit_sha.as_str(), parent_sha.as_str()))
-            .collect();
-        rewrite_metric_commits
-            .into_iter()
-            .map(|mut commit| {
-                if let Some(parent_sha) = parent_by_commit.get(commit.new_sha.as_str()) {
-                    commit = commit.with_parent_sha((*parent_sha).to_string());
-                }
-                if let Some(diff) = diff_by_commit.get(commit.new_sha.as_str()) {
-                    commit = commit.with_parent_diff((*diff).clone());
-                }
-                commit
-            })
-            .collect()
-    };
-    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, rewrite_metric_commits);
-
-    Ok(())
-}
-
-fn apply_cherry_pick_no_commit_rewrite(
-    repo: &crate::git::repository::Repository,
-    sources: &[String],
-    parent_head: &str,
-    new_head: &str,
-) -> Result<(), GitAiError> {
-    if sources.is_empty() || new_head.is_empty() {
-        return Ok(());
-    }
-    let mappings = sources
-        .iter()
-        .map(|source| (source.clone(), new_head.to_string()))
-        .collect::<Vec<_>>();
-    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, sources);
-    let shifted_notes =
-        crate::authorship::rewrite::shift_authorship_notes_merging_existing_with_notes(
-            repo, &mappings,
-        )?;
-    if crate::authorship::rewrite::rewrite_metrics_enabled() {
-        let mut metric_commit = crate::authorship::rewrite::RewriteMetricCommit::new(
-            new_head.to_string(),
-            sources.to_vec(),
-            crate::authorship::rewrite::RewriteMetricOperation::CherryPickNoCommit,
-        )
-        .with_parent_sha(parent_head.to_string());
-        if let Some((_, note)) = shifted_notes
-            .into_iter()
-            .find(|(commit_sha, _)| commit_sha == new_head)
-        {
-            metric_commit = metric_commit.with_authorship_note(note);
-        }
-        crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(repo, vec![metric_commit]);
-    }
-    Ok(())
-}
-
-fn strict_rebase_original_head_from_command(
-    cmd: &crate::daemon::domain::NormalizedCommand,
-    semantic_old_head: &str,
-) -> Option<String> {
-    if let Some(branch_spec) = explicit_rebase_branch_arg(&cmd.invoked_args)
-        && let Some(branch_ref) = explicit_rebase_branch_ref_name(&branch_spec)
-        && let Some(old_head) = cmd
-            .ref_changes
-            .iter()
-            .find(|change| {
-                change.reference == branch_ref
-                    && is_valid_oid(&change.old)
-                    && !is_zero_oid(&change.old)
-            })
-            .map(|change| change.old.clone())
-    {
-        return Some(old_head);
-    }
-
-    if is_valid_oid(semantic_old_head) && !is_zero_oid(semantic_old_head) {
-        return Some(semantic_old_head.to_string());
-    }
-
-    if let Some(old_head) = cmd
-        .ref_changes
-        .iter()
-        .find(|change| {
-            change.reference.starts_with("refs/heads/")
-                && is_valid_oid(&change.old)
-                && !is_zero_oid(&change.old)
-        })
-        .map(|change| change.old.clone())
-    {
-        return Some(old_head);
-    }
-
-    if let Some(old_head) = cmd
-        .ref_changes
-        .iter()
-        .find(|change| {
-            change.reference == "HEAD" && is_valid_oid(&change.old) && !is_zero_oid(&change.old)
-        })
-        .map(|change| change.old.clone())
-    {
-        return Some(old_head);
-    }
-
-    None
-}
-
-fn explicit_rebase_branch_ref_name(branch_spec: &str) -> Option<String> {
-    if branch_spec.starts_with("refs/") {
-        return Some(branch_spec.to_string());
-    }
-    if is_valid_oid(branch_spec) || branch_spec == "HEAD" || branch_spec.starts_with("@{") {
-        return None;
-    }
-    Some(format!("refs/heads/{}", branch_spec))
 }
 
 fn now_unix_nanos() -> u128 {
@@ -2708,7 +1263,7 @@ fn read_checkpoint_body<R: BufRead>(
             format!("failed receiving checkpoint body delimiter: {error}"),
         ))
     })?;
-    if delimiter != [b'\n'] {
+    if delimiter != *b"\n" {
         return Err(GitAiError::Generic(
             "checkpoint body was not followed by a newline delimiter".to_string(),
         ));
@@ -2725,65 +1280,11 @@ enum FamilySequencerEntry {
     /// the family's other passes (#2252).
     AppliedSideEffects {
         applied: Box<crate::daemon::domain::AppliedCommand>,
-        commit_file_timestamp_snapshots: CommitFileTimestampSnapshotHandles,
     },
     Checkpoint {
         request: Box<CheckpointRequest>,
         receipt_seq: u64,
         reservation: CheckpointIngressReservation,
-    },
-    /// One untraced-commit fixup pass over a worktree `HEAD` reflog (see
-    /// `RefCursor::claim_untraced_commits`). Sequenced like a command so it is
-    /// fenced behind older open roots and serialized with the family's other
-    /// passes; it never runs while a traced command of the family is in flight.
-    UntracedCommitScan {
-        git_dir: PathBuf,
-        worktree: PathBuf,
-        /// Persisted cursor for a worktree this daemon has not seen yet.
-        seed: Option<UntracedReflogCursor>,
-        /// `HEAD` reflog length when the pass was scheduled. The causal fence
-        /// only holds a pass for roots that started before it, so records
-        /// written after this point are left for a later pass.
-        max_offset: Option<u64>,
-    },
-}
-
-/// What one round of untraced-commit fixup scheduling did.
-#[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct UntracedScanSchedule {
-    /// Families with at least one pass scheduled.
-    families: usize,
-    /// Worktrees a pass was scheduled for.
-    worktrees: usize,
-    /// Worktrees whose `HEAD` reflog has not grown since their cursor settled.
-    unchanged: usize,
-    /// Changed worktrees left for the next tick: by the per-tick cap, or
-    /// because a git command of their family was still running.
-    deferred: usize,
-    /// Families the fixup ignores (temp scratch repositories, configured
-    /// globs) that were named or remembered and therefore skipped.
-    ignored: usize,
-}
-
-/// What the daemon remembers about one worktree between fixup ticks.
-#[derive(Debug, Clone, Default)]
-struct CachedUntracedCursor {
-    /// `None` when the store has no row for the worktree yet.
-    cursor: Option<UntracedReflogCursor>,
-    /// The `HEAD` reflog as it looked when the last pass finished (`None`
-    /// until a pass has run; `Some(None)` when there was no reflog then).
-    reflog_seen: Option<HeadReflogObservation>,
-}
-
-/// Why fixup scans are being scheduled; a tick stats before it schedules,
-/// an explicit request scans regardless.
-#[derive(Debug, Clone, Copy)]
-enum UntracedScanTrigger {
-    Request,
-    Tick {
-        rotation: u64,
-        /// Hourly: prune the store and re-probe families last seen missing.
-        maintenance: bool,
     },
 }
 
@@ -2930,14 +1431,6 @@ enum FamilyFrontDisposition {
     },
 }
 
-type CommitFileTimestampSnapshotHandle =
-    tokio::task::JoinHandle<Option<crate::authorship::attribution_recovery::FileTimestampsByPath>>;
-type CommitFileTimestampSnapshotHandles = HashMap<String, CommitFileTimestampSnapshotHandle>;
-
-const COMMIT_FILE_TIMESTAMP_SNAPSHOT_WAIT: Duration = Duration::from_millis(500);
-const SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT: Duration = Duration::from_secs(2);
-const SESSION_EVENT_RECOVERY_PREFLIGHT_POLL: Duration = Duration::from_millis(100);
-
 /// RAII registration of an in-flight family side-effect pass; see
 /// [`ActorDaemonCoordinator::begin_family_effect_guarded`].
 struct FamilyEffectGuard<'a> {
@@ -2960,48 +1453,6 @@ fn panic_payload_message(panic_payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "unknown panic".to_string()
     }
-}
-
-fn run_blocking_side_effect<T>(operation: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-    {
-        tokio::task::block_in_place(operation)
-    } else {
-        operation()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PendingSquashMerge {
-    source_head: String,
-    onto: String,
-}
-
-#[derive(Debug, Clone)]
-struct PendingCherryPickNoCommit {
-    source_commits: Vec<String>,
-    head: String,
-}
-
-#[derive(Debug, Clone)]
-struct PendingRebase {
-    original_head: String,
-    onto: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-enum RecentReplayPrerequisite {
-    CheckoutSwitchRename {
-        target_head: String,
-        old_head: String,
-    },
-    CheckoutSwitchMerge {
-        target_head: String,
-        old_head: String,
-        final_state: HashMap<String, String>,
-    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3039,14 +1490,9 @@ pub struct ActorDaemonCoordinator {
             crate::daemon::git_backend::SystemGitBackend,
         >,
     >,
-    pending_rebase_original_head_by_worktree: Mutex<HashMap<String, PendingRebase>>,
-    pending_cherry_pick_sources_by_worktree: Mutex<HashMap<String, Vec<String>>>,
-    pending_cherry_pick_no_commit_by_worktree: Mutex<HashMap<String, PendingCherryPickNoCommit>>,
-    pending_squash_merge_by_worktree: Mutex<HashMap<String, PendingSquashMerge>>,
     inflight_effects_by_family: Mutex<HashMap<String, usize>>,
     /// Files with an in-flight AI edit (PreFileEdit received, PostFileEdit not yet completed).
     /// Outer key: family. Inner key: absolute file path string. Value: registration timestamp (nanos).
-    pending_ai_edits_by_family: Mutex<HashMap<String, HashMap<String, u128>>>,
     family_sequencers_by_family: Mutex<HashMap<String, FamilySequencerState>>,
     started_at: Instant,
     /// See [`FAMILY_CAUSAL_GRACE`].
@@ -3056,36 +1502,10 @@ pub struct ActorDaemonCoordinator {
     causal_grace_expirations: AtomicU64,
     /// Fences released at a time bound (hard cap, written-root cap).
     causal_fence_hard_cap_releases: AtomicU64,
-    /// Untraced-commit fixup outcomes (see `run_untraced_commit_scan`).
-    untraced_commits_fixed: AtomicU64,
-    untraced_commits_skipped: AtomicU64,
-    untraced_cursor_reseeds: AtomicU64,
-    untraced_scan_errors: AtomicU64,
-    /// Families remembered in the repo-family store, as of the last tick.
-    known_repo_families: AtomicU64,
-    /// Ticks so far; rotates which worktrees a capped tick scans first.
-    untraced_fixup_ticks: AtomicU64,
-    /// When the repo-family store was last pruned and missing families last
-    /// re-probed (unix seconds).
-    untraced_store_last_maintenance_secs: AtomicU64,
-    /// Per worktree git dir, the fixup cursor last read from or written to the
-    /// store and how the `HEAD` reflog looked when the last pass finished, so
-    /// a routine tick never touches SQLite: its cost is one `stat` per worktree.
-    untraced_cursor_cache: Mutex<HashMap<String, CachedUntracedCursor>>,
-    /// Families remembered in the store as of the last maintenance round,
-    /// plus those recorded by passes since; `None` before the first round.
-    untraced_known_families: Mutex<Option<Vec<String>>>,
-    /// Families whose common dir was found missing since the last maintenance
-    /// round; routine ticks neither probe nor record them again.
-    untraced_missing_families: Mutex<HashSet<String>>,
     /// Fired when a root clears or is released: fenced drains and waits
     /// re-evaluate. Distinct from the per-frame ingest progress notify so a
     /// fenced family does not wake on every trace frame the daemon sees.
     trace_root_fence_notify: Notify,
-    commit_file_timestamp_snapshots_by_root:
-        Mutex<HashMap<String, CommitFileTimestampSnapshotHandles>>,
-    recent_replay_prerequisites_by_family:
-        Mutex<HashMap<String, VecDeque<RecentReplayPrerequisite>>>,
     side_effect_errors_by_family: Mutex<HashMap<String, BTreeMap<u64, String>>>,
     side_effect_exec_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Families with a scheduled-or-running coalesced drain task; see
@@ -3100,33 +1520,13 @@ pub struct ActorDaemonCoordinator {
     unadmitted_checkpoints: AtomicUsize,
     accepting_checkpoints: AtomicBool,
     checkpoint_progress_notify: Notify,
-    bash_sessions: Mutex<crate::daemon::bash_sessions::BashSessionState>,
+    link_checkpoints: Arc<link_checkpoints::CheckpointRuntime>,
     test_completion_log_dir: Option<PathBuf>,
     test_completion_log_lock: Mutex<()>,
     // OnceLock: set once at worker start, never cleared. The ingest worker
     // exits via the shutdown select! arm instead of relying on channel closure.
     trace_ingest_tx: std::sync::OnceLock<mpsc::Sender<Value>>,
     telemetry_worker: Option<crate::daemon::telemetry_worker::DaemonTelemetryWorkerHandle>,
-    /// Families and fixup cursors remembered across restarts; `None` when the
-    /// database could not be opened (fixup then only covers this process).
-    repo_family_store: Option<Arc<crate::daemon::repo_family_store::RepoFamilyStore>>,
-    /// Repositories the untraced-commit fixup leaves alone (temp scratch repos,
-    /// configured globs); consulted only by the fixup scheduler and store, and
-    /// rebuilt from a fresh config read on each maintenance round so a config
-    /// change takes effect within the hour rather than at the next restart.
-    untraced_fixup_ignore: Mutex<crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore>,
-    /// Worktree git dirs whose fixup cursor must not be persisted again this
-    /// lifetime: a pass had a side effect fail, and the durable cursor has to
-    /// stay behind that commit so a later lifetime can retry it.
-    untraced_persistence_blocked: Mutex<HashSet<String>>,
-    stream_worker: Option<crate::daemon::stream_worker::StreamWorkerHandle>,
-    token_usage_worker: Option<crate::daemon::token_usage_worker::TokenUsageWorkerHandle>,
-    transcript_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    // Separate from the transcript worker's Notify: notify_one wakes exactly
-    // one waiter, so each worker needs its own.
-    token_usage_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    untraced_fixup_shutdown_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
-    streams_db: Option<Arc<crate::streams::db::StreamsDatabase>>,
     next_trace_ingest_seq: AtomicUsize,
     queued_trace_payloads: AtomicUsize,
     queued_trace_payloads_by_root: Mutex<HashMap<String, usize>>,
@@ -3220,30 +1620,13 @@ impl ActorDaemonCoordinator {
                 backend.clone(),
             )),
             backend,
-            pending_rebase_original_head_by_worktree: Mutex::new(HashMap::new()),
-            pending_cherry_pick_sources_by_worktree: Mutex::new(HashMap::new()),
-            pending_cherry_pick_no_commit_by_worktree: Mutex::new(HashMap::new()),
-            pending_squash_merge_by_worktree: Mutex::new(HashMap::new()),
             inflight_effects_by_family: Mutex::new(HashMap::new()),
-            pending_ai_edits_by_family: Mutex::new(HashMap::new()),
             family_sequencers_by_family: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             causal_grace: family_causal_grace(),
             causal_grace_expirations: AtomicU64::new(0),
             causal_fence_hard_cap_releases: AtomicU64::new(0),
-            untraced_commits_fixed: AtomicU64::new(0),
-            untraced_commits_skipped: AtomicU64::new(0),
-            untraced_cursor_reseeds: AtomicU64::new(0),
-            untraced_scan_errors: AtomicU64::new(0),
-            known_repo_families: AtomicU64::new(0),
-            untraced_fixup_ticks: AtomicU64::new(0),
-            untraced_store_last_maintenance_secs: AtomicU64::new(0),
-            untraced_cursor_cache: Mutex::new(HashMap::new()),
-            untraced_known_families: Mutex::new(None),
-            untraced_missing_families: Mutex::new(HashSet::new()),
             trace_root_fence_notify: Notify::new(),
-            commit_file_timestamp_snapshots_by_root: Mutex::new(HashMap::new()),
-            recent_replay_prerequisites_by_family: Mutex::new(HashMap::new()),
             side_effect_errors_by_family: Mutex::new(HashMap::new()),
             side_effect_exec_locks: Mutex::new(HashMap::new()),
             scheduled_family_drains: Mutex::new(HashSet::new()),
@@ -3259,7 +1642,7 @@ impl ActorDaemonCoordinator {
             unadmitted_checkpoints: AtomicUsize::new(0),
             accepting_checkpoints: AtomicBool::new(true),
             checkpoint_progress_notify: Notify::new(),
-            bash_sessions: Mutex::new(crate::daemon::bash_sessions::BashSessionState::new()),
+            link_checkpoints: Arc::new(link_checkpoints::CheckpointRuntime::default()),
             test_completion_log_dir: std::env::var("GIT_AI_TEST_DB_PATH")
                 .ok()
                 .or_else(|| std::env::var("GITAI_TEST_DB_PATH").ok())
@@ -3273,15 +1656,6 @@ impl ActorDaemonCoordinator {
             test_completion_log_lock: Mutex::new(()),
             trace_ingest_tx: std::sync::OnceLock::new(),
             telemetry_worker: None,
-            repo_family_store: None,
-            untraced_persistence_blocked: Mutex::new(HashSet::new()),
-            untraced_fixup_ignore: Mutex::new(Default::default()),
-            stream_worker: None,
-            token_usage_worker: None,
-            transcript_shutdown_notify: std::sync::OnceLock::new(),
-            token_usage_shutdown_notify: std::sync::OnceLock::new(),
-            untraced_fixup_shutdown_notify: std::sync::OnceLock::new(),
-            streams_db: None,
             next_trace_ingest_seq: AtomicUsize::new(0),
             queued_trace_payloads: AtomicUsize::new(0),
             queued_trace_payloads_by_root: Mutex::new(HashMap::new()),
@@ -3312,188 +1686,6 @@ impl ActorDaemonCoordinator {
         // Acquire pairs with the Release store in request_shutdown so all
         // writes made before shutdown is requested are visible to the caller.
         self.shutting_down.load(Ordering::Acquire)
-    }
-
-    fn trigger_transcript_sweep(&self, trigger: crate::daemon::stream_worker::SweepTrigger) {
-        let Some(worker) = &self.stream_worker else {
-            tracing::debug!(trigger = %trigger, "transcript sweep trigger skipped; worker is not running");
-            return;
-        };
-
-        if worker.trigger_sweep(trigger) {
-            tracing::info!(trigger = %trigger, "transcript sweep trigger enqueued");
-        } else {
-            tracing::debug!(trigger = %trigger, "transcript sweep trigger not enqueued");
-        }
-    }
-
-    fn trigger_transcript_sweep_for_recovery(
-        &self,
-        trigger: crate::daemon::stream_worker::SweepTrigger,
-    ) -> Option<std::sync::mpsc::Receiver<Result<(), String>>> {
-        let Some(worker) = &self.stream_worker else {
-            tracing::debug!(trigger = %trigger, "recovery transcript sweep skipped; worker is not running");
-            return None;
-        };
-
-        let completion = worker.trigger_sweep_for_recovery(trigger);
-        if completion.is_some() {
-            tracing::info!(trigger = %trigger, "recovery transcript sweep enqueued");
-        } else {
-            tracing::debug!(trigger = %trigger, "recovery transcript sweep not enqueued");
-        }
-        completion
-    }
-
-    fn wait_for_session_event_recovery_candidate(
-        &self,
-        repo: &Repository,
-        commit_sha: &str,
-        recovery_file_timestamps: Option<
-            &crate::authorship::attribution_recovery::FileTimestampsByPath,
-        >,
-        unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile,
-    ) {
-        if unknown_by_file.is_empty() {
-            return;
-        }
-        let unknown_files = unknown_by_file
-            .keys()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let mut timestamps = recovery_file_timestamps
-            .map(|recovery_file_timestamps| {
-                recovery_file_timestamps
-                    .iter()
-                    .filter(|(file_path, _)| unknown_files.contains(file_path.as_str()))
-                    .flat_map(|(_, values)| values.iter().copied())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if timestamps.is_empty()
-            && let Ok(workdir) = repo.workdir()
-            && let Ok(fallback_timestamps) = capture_commit_file_timestamps(&workdir, commit_sha)
-        {
-            timestamps = fallback_timestamps
-                .iter()
-                .filter(|(file_path, _)| unknown_files.contains(file_path.as_str()))
-                .flat_map(|(_, values)| values.iter().copied())
-                .collect::<Vec<_>>();
-        }
-        if timestamps.is_empty() {
-            timestamps = recovery_file_timestamps
-                .map(|recovery_file_timestamps| {
-                    recovery_file_timestamps
-                        .values()
-                        .flat_map(|values| values.iter().copied())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-        }
-        if timestamps.is_empty()
-            && let Ok(workdir) = repo.workdir()
-            && let Ok(fallback_timestamps) = capture_commit_file_timestamps(&workdir, commit_sha)
-        {
-            timestamps = fallback_timestamps
-                .values()
-                .flat_map(|values| values.iter().copied())
-                .collect::<Vec<_>>();
-        }
-        if timestamps.is_empty() {
-            return;
-        }
-        timestamps.sort_unstable();
-        timestamps.dedup();
-
-        let Some(target_repo_url) = crate::repo_url::resolve_repo_url_from_repo(repo) else {
-            return;
-        };
-
-        let candidate_check = || {
-            crate::authorship::attribution_recovery::matching_session_event_candidate_exists(
-                &timestamps,
-                &target_repo_url,
-            )
-        };
-        // Only a definitive "no candidate" justifies the sweep-and-wait below.
-        // An unknown answer (metrics DB busy under telemetry load) must not
-        // add sweep work and preflight latency to the commit path.
-        match candidate_check() {
-            Some(false) => {}
-            Some(true) => return,
-            None => {
-                tracing::debug!("session-event recovery preflight skipped; metrics DB busy");
-                return;
-            }
-        }
-
-        let deadline = std::time::Instant::now() + SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT;
-        let sweep_completion = self.trigger_transcript_sweep_for_recovery(
-            crate::daemon::stream_worker::SweepTrigger::PostCommit,
-        );
-
-        let Some(sweep_completion) = sweep_completion else {
-            return;
-        };
-
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::debug!(
-                wait_ms = SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT.as_millis() as u64,
-                "recovery transcript sweep wait expired"
-            );
-            return;
-        }
-        match sweep_completion.recv_timeout(remaining) {
-            Ok(Ok(())) => {
-                tracing::debug!("recovery transcript sweep completed before post-commit");
-            }
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    %error,
-                    "recovery transcript sweep failed before post-commit"
-                );
-                return;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                tracing::debug!(
-                    wait_ms = SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT.as_millis() as u64,
-                    "recovery transcript sweep wait expired"
-                );
-                return;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::debug!("recovery transcript sweep completion channel disconnected");
-                return;
-            }
-        }
-
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::debug!(
-                    wait_ms = SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT.as_millis() as u64,
-                    "session-event recovery preflight wait expired"
-                );
-                return;
-            }
-            std::thread::sleep(remaining.min(SESSION_EVENT_RECOVERY_PREFLIGHT_POLL));
-            // A definitive hit or an unknown (busy DB) both end the wait: the
-            // preflight must never hold the commit path hostage to telemetry.
-            if !matches!(candidate_check(), Some(false)) {
-                tracing::debug!(
-                    "session-event recovery candidate became visible before post-commit"
-                );
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                tracing::debug!(
-                    wait_ms = SESSION_EVENT_RECOVERY_PREFLIGHT_WAIT.as_millis() as u64,
-                    "session-event recovery preflight wait expired"
-                );
-                return;
-            }
-        }
     }
 
     fn issue_trace_drain_probe_id(&self) -> u64 {
@@ -3594,15 +1786,6 @@ impl ActorDaemonCoordinator {
         // The ingest worker exits via its select! shutdown arm (watching
         // shutdown_notify); we no longer rely on channel closure to stop it.
         self.shutdown_notify.notify_waiters();
-        if let Some(transcript_shutdown) = self.transcript_shutdown_notify.get() {
-            transcript_shutdown.notify_one();
-        }
-        if let Some(token_usage_shutdown) = self.token_usage_shutdown_notify.get() {
-            token_usage_shutdown.notify_one();
-        }
-        if let Some(untraced_fixup_shutdown) = self.untraced_fixup_shutdown_notify.get() {
-            untraced_fixup_shutdown.notify_one();
-        }
         // Hold the condvar mutex so notify_all cannot race with the
         // check-then-wait sequence in daemon_update_check_loop.
         let _guard = self
@@ -3731,12 +1914,6 @@ impl ActorDaemonCoordinator {
     /// Garbage-collect empty or idle entries from per-family and per-root maps
     /// to prevent unbounded memory growth in long-running daemon processes.
     fn gc_stale_family_state(&self) {
-        // NOTE: Do NOT call normalizer.sweep_orphans() here — it removes ALL
-        // pending/deferred roots unconditionally which destroys in-flight trace
-        // state.  sweep_orphans() is only safe at daemon shutdown.
-        if let Ok(mut map) = self.recent_replay_prerequisites_by_family.lock() {
-            map.retain(|_, entries| !entries.is_empty());
-        }
         if let Ok(mut map) = self.side_effect_errors_by_family.lock() {
             map.retain(|_, errors| !errors.is_empty());
         }
@@ -3744,84 +1921,11 @@ impl ActorDaemonCoordinator {
             map.retain(|_, state| !state.entries.is_empty());
         }
         if let Ok(mut map) = self.side_effect_exec_locks.lock() {
-            // Evict only IDLE locks (strong_count == 1: the map holds the sole
-            // Arc). A lock with clones out is held or awaited by a drain;
-            // evicting it would hand the next drain a fresh unlocked mutex and
-            // run two drains concurrently on one family, tearing working-log
-            // read-modify-writes. The map mutex makes this check atomic with
-            // removal; idle locks are safely recreated on demand.
             map.retain(|_, lock| Arc::strong_count(lock) > 1);
-        }
-        if let Ok(mut map) = self.pending_rebase_original_head_by_worktree.lock() {
-            map.shrink_to_fit();
-        }
-        if let Ok(mut map) = self.pending_cherry_pick_sources_by_worktree.lock() {
-            map.retain(|_, sources| !sources.is_empty());
-        }
-        if let Ok(mut map) = self.pending_squash_merge_by_worktree.lock() {
-            map.retain(|_, pending| {
-                !pending.source_head.trim().is_empty() && !pending.onto.trim().is_empty()
-            });
         }
         if let Ok(mut map) = self.queued_trace_payloads_by_root.lock() {
             map.retain(|_, count| *count > 0);
         }
-        // Clean expired pending AI edit entries (older than 10s).
-        {
-            const PENDING_AI_EDIT_TIMEOUT_NS: u128 = 10_000_000_000;
-            let gc_now_ns = now_unix_nanos();
-            if let Ok(mut map) = self.pending_ai_edits_by_family.lock() {
-                for family_map in map.values_mut() {
-                    family_map.retain(|_, registered_at| {
-                        gc_now_ns.saturating_sub(*registered_at) < PENDING_AI_EDIT_TIMEOUT_NS
-                    });
-                }
-                map.retain(|_, family_map| !family_map.is_empty());
-            }
-        }
-    }
-
-    fn canonicalize_path(path: &str) -> String {
-        std::fs::canonicalize(path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| path.to_string())
-    }
-
-    fn register_pending_ai_edits(&self, family: &str, file_paths: &[String]) {
-        let now_ns = now_unix_nanos();
-        if let Ok(mut map) = self.pending_ai_edits_by_family.lock() {
-            let family_map = map.entry(family.to_string()).or_default();
-            for file in file_paths {
-                family_map.insert(Self::canonicalize_path(file), now_ns);
-            }
-        }
-    }
-
-    fn clear_pending_ai_edits(&self, family: &str, file_paths: &[String]) {
-        if let Ok(mut map) = self.pending_ai_edits_by_family.lock()
-            && let Some(family_map) = map.get_mut(family)
-        {
-            for file in file_paths {
-                family_map.remove(&Self::canonicalize_path(file));
-            }
-            if family_map.is_empty() {
-                map.remove(family);
-            }
-        }
-    }
-
-    fn file_has_pending_ai_edit(&self, family: &str, file_path: &str) -> bool {
-        const PENDING_AI_EDIT_TIMEOUT_NS: u128 = 10_000_000_000; // 10 seconds
-        let now_ns = now_unix_nanos();
-        let canonical = Self::canonicalize_path(file_path);
-        if let Ok(map) = self.pending_ai_edits_by_family.lock()
-            && let Some(family_map) = map.get(family)
-        {
-            return family_map.get(&canonical).is_some_and(|registered_at| {
-                now_ns.saturating_sub(*registered_at) < PENDING_AI_EDIT_TIMEOUT_NS
-            });
-        }
-        false
     }
 
     fn trace_invocation_participates_in_family_sequencer(
@@ -4052,7 +2156,6 @@ impl ActorDaemonCoordinator {
                 "applied_side_effects",
             ),
             FamilySequencerEntry::Checkpoint { .. } => (None, "checkpoint"),
-            FamilySequencerEntry::UntracedCommitScan { .. } => (None, "untraced_scan"),
         }
     }
 
@@ -4362,27 +2465,6 @@ impl ActorDaemonCoordinator {
             .and_then(|errors| errors.iter().next_back().map(|(_, error)| error.clone())))
     }
 
-    fn record_recent_replay_prerequisite(
-        &self,
-        family: &str,
-        prerequisite: RecentReplayPrerequisite,
-    ) -> Result<(), GitAiError> {
-        const MAX_RECENT_REPLAY_PREREQUISITES_PER_FAMILY: usize = 256;
-
-        let mut map = self
-            .recent_replay_prerequisites_by_family
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("recent replay prerequisites map lock poisoned".to_string())
-            })?;
-        let entries = map.entry(family.to_string()).or_insert_with(VecDeque::new);
-        entries.push_back(prerequisite);
-        while entries.len() > MAX_RECENT_REPLAY_PREREQUISITES_PER_FAMILY {
-            let _ = entries.pop_front();
-        }
-        Ok(())
-    }
-
     fn maybe_append_test_completion_log(
         &self,
         family: &str,
@@ -4418,24 +2500,17 @@ impl ActorDaemonCoordinator {
     ) -> Result<(), GitAiError> {
         // A fixup-synthesized commit is not a command a test issued, so it must
         // never satisfy a test's wait for its own traced commands.
-        let untraced = is_untraced_root_sid(&applied.command.root_sid);
-        let sync_tracked = !untraced
-            && crate::daemon::test_sync::tracks_primary_command_for_test_sync(
-                applied.command.primary_command.as_deref(),
-                &applied.command.invoked_args,
-            );
+        let sync_tracked = crate::daemon::test_sync::tracks_primary_command_for_test_sync(
+            applied.command.primary_command.as_deref(),
+            &applied.command.invoked_args,
+        );
         let test_sync_session = crate::daemon::test_sync::test_sync_session_from_invocation(
             &parsed_invocation_for_normalized_command(&applied.command),
         );
         let log_entry = TestCompletionLogEntry {
             seq: applied.seq,
             family_key: family.to_string(),
-            kind: if untraced {
-                "untraced_fixup"
-            } else {
-                "command"
-            }
-            .to_string(),
+            kind: "command".to_string(),
             primary_command: applied.command.primary_command.clone(),
             test_sync_session,
             exit_code: Some(applied.command.exit_code),
@@ -4959,19 +3034,14 @@ impl ActorDaemonCoordinator {
                 GitAiError::Generic(format!("invalid accepted checkpoint body: {error}"))
             })?;
         #[cfg(feature = "test-support")]
-        if let Some(delay) =
-            checkpoint_test_delay("GIT_AI_TEST_DELAY_CHECKPOINT_ADMISSION", &request.trace_id)
-        {
+        if let Some(delay) = checkpoint_test_delay(
+            "GIT_AI_TEST_DELAY_CHECKPOINT_ADMISSION",
+            &request.request_id,
+        ) {
             tokio::time::sleep(delay).await;
         }
-        let trace_id = request.trace_id.clone();
-        let file_count = request.files.len();
-        let Some(repo_work_dir) = request.files.first().map(|file| file.repo_work_dir.clone())
-        else {
-            return Err(GitAiError::Generic(
-                "accepted checkpoint contains no files".to_string(),
-            ));
-        };
+        let trace_id = request.request_id.clone();
+        let repo_work_dir = request.repo_working_dir.clone();
         let family = self.backend.resolve_family(&repo_work_dir)?.0;
         crate::wltrace::wltrace("checkpoint.admission", Path::new(&family), || {
             format!(
@@ -4981,7 +3051,6 @@ impl ActorDaemonCoordinator {
             )
         });
 
-        self.notify_checkpoint_stream(&request);
         self.wait_for_trace_ingest_seq_logging_delay(
             accepted.trace_ingest_target,
             accepted.receipt_seq,
@@ -4995,7 +3064,6 @@ impl ActorDaemonCoordinator {
             receipt_seq = accepted.receipt_seq,
             %trace_id,
             %family,
-            file_count,
             retained_bytes = accepted.reservation.body_bytes(),
             receipt_to_admission_ms =
                 now_unix_nanos().saturating_sub(accepted.received_at_ns) / 1_000_000,
@@ -5009,28 +3077,6 @@ impl ActorDaemonCoordinator {
             request,
             reservation: accepted.reservation,
         })
-    }
-
-    fn notify_checkpoint_stream(&self, request: &CheckpointRequest) {
-        if let Some(worker) = &self.stream_worker
-            && let Some(stream_source) = &request.stream_source
-        {
-            let tool = request
-                .agent_id
-                .as_ref()
-                .map(|agent| agent.tool.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            worker.notify_checkpoint(
-                stream_source.session_id.clone(),
-                tool,
-                request.trace_id.clone(),
-                request.metadata.get("tool_use_id").cloned(),
-                stream_source.path.clone(),
-                request.files.first().map(|file| file.repo_work_dir.clone()),
-                stream_source.external_session_id.clone(),
-                stream_source.external_parent_session_id.clone(),
-            );
-        }
     }
 
     fn complete_checkpoint_admission(
@@ -5520,517 +3566,6 @@ impl ActorDaemonCoordinator {
     /// in-memory cursor has moved on (the traced path does not retry side
     /// effects either), but leaving the durable cursor behind lets the next
     /// daemon lifetime retry the commit, skipping any that did get their note.
-    async fn run_untraced_commit_scan(
-        &self,
-        family: &str,
-        git_dir: PathBuf,
-        worktree: PathBuf,
-        seed: Option<UntracedReflogCursor>,
-        max_offset: Option<u64>,
-        order: u64,
-    ) -> Result<Option<UntracedReflogCursor>, GitAiError> {
-        let request = UntracedClaimRequest {
-            git_dir: git_dir.clone(),
-            worktree: worktree.clone(),
-            seed,
-            // Reflog timestamps are whole seconds: round the age up so a
-            // sub-second override never becomes "no minimum age".
-            min_age_secs: untraced_fixup_min_age().as_millis().div_ceil(1000) as i64,
-            now_secs: crate::utils::unix_timestamp_now() as i64,
-            max_commits: UNTRACED_FIXUP_MAX_COMMITS_PER_PASS,
-            max_offset,
-        };
-        let outcome = self
-            .coordinator
-            .claim_untraced_commits(crate::daemon::domain::FamilyKey::new(family), request)
-            .await?;
-        self.untraced_commits_skipped
-            .fetch_add(outcome.skipped as u64, Ordering::Relaxed);
-        if outcome.reseeded {
-            self.untraced_cursor_reseeds.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // A pass that died between writing a note and recording its cursor
-        // would claim the same commit twice; the note is the durable receipt.
-        let new_heads = outcome
-            .applied
-            .iter()
-            .filter_map(commit_created_new_head)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let already_noted = if new_heads.is_empty() {
-            HashSet::new()
-        } else {
-            let worktree = worktree.clone();
-            run_blocking_side_effect(move || {
-                let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-                crate::git::notes_api::commits_with_notes(&repo, &new_heads)
-            })
-            .unwrap_or_else(|error| {
-                // Best-effort guard against a pass that died mid-way; the
-                // claimed commits must still be attributed.
-                tracing::warn!(%error, %family, "could not check existing notes before fixup");
-                HashSet::new()
-            })
-        };
-
-        // A record whose command could not be reduced was consumed without any
-        // side effect: that pass is not settled either.
-        let mut all_side_effects_succeeded = outcome.dropped == 0;
-        if outcome.dropped > 0 {
-            self.untraced_scan_errors
-                .fetch_add(outcome.dropped as u64, Ordering::Relaxed);
-        }
-        for applied in &outcome.applied {
-            if commit_created_new_head(applied).is_some_and(|head| already_noted.contains(head)) {
-                self.untraced_commits_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let mut snapshots = CommitFileTimestampSnapshotHandles::default();
-            let future = self.maybe_apply_side_effects_for_applied_command(
-                Some(family),
-                applied,
-                &mut snapshots,
-            );
-            let result = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                future,
-            ))
-            .await
-            {
-                Ok(result) => result,
-                Err(panic_payload) => Err(GitAiError::Generic(format!(
-                    "daemon command side effect panic: {}",
-                    panic_payload_message(panic_payload.as_ref())
-                ))),
-            };
-            match &result {
-                Ok(()) => {
-                    self.untraced_commits_fixed.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(error) => {
-                    all_side_effects_succeeded = false;
-                    self.untraced_scan_errors.fetch_add(1, Ordering::Relaxed);
-                    let _ = self.record_side_effect_error(family, order, error);
-                    tracing::error!(
-                        %error,
-                        %family,
-                        seq = applied.seq,
-                        "untraced commit side effect failed"
-                    );
-                }
-            }
-            if let Err(error) = self.append_command_completion_log(family, applied, &result, order)
-            {
-                tracing::error!(%error, %family, order, "command completion log write failed");
-            }
-        }
-        if outcome.more {
-            let max_offset = head_reflog_len(&git_dir);
-            self.append_family_sequencer_entry(
-                family,
-                now_unix_nanos(),
-                FamilySequencerEntry::UntracedCommitScan {
-                    git_dir,
-                    worktree,
-                    seed: None,
-                    max_offset,
-                },
-            )?;
-        }
-        Ok(all_side_effects_succeeded.then_some(outcome.cursor))
-    }
-
-    /// One periodic fixup tick: every known worktree whose `HEAD` reflog grew
-    /// since its cursor settled gets a pass, at most
-    /// `UNTRACED_FIXUP_MAX_SCANS_PER_TICK` of them (rotating). Skipped
-    /// entirely while trace frames are still queued, so a pass never runs
-    /// ahead of the commands those frames describe.
-    pub(crate) async fn run_untraced_fixup_tick(
-        self: &Arc<Self>,
-    ) -> Result<UntracedScanSchedule, GitAiError> {
-        let ingest_lag = self
-            .next_trace_ingest_seq
-            .load(Ordering::Acquire)
-            .saturating_sub(self.processed_trace_ingest_seq.load(Ordering::Acquire));
-        if self.queued_trace_payloads.load(Ordering::Acquire) > 0 || ingest_lag > 0 {
-            return Ok(UntracedScanSchedule::default());
-        }
-        let tick = self.untraced_fixup_ticks.fetch_add(1, Ordering::Relaxed);
-        let now_secs = crate::utils::unix_timestamp_now();
-        let last_maintenance = self
-            .untraced_store_last_maintenance_secs
-            .load(Ordering::Relaxed);
-        let maintenance = now_secs.saturating_sub(last_maintenance)
-            >= UNTRACED_STORE_MAINTENANCE_INTERVAL.as_secs();
-        if maintenance {
-            self.untraced_store_last_maintenance_secs
-                .store(now_secs, Ordering::Relaxed);
-        }
-        let schedule = self
-            .schedule_untraced_commit_scans(
-                None,
-                UntracedScanTrigger::Tick {
-                    rotation: tick,
-                    maintenance,
-                },
-            )
-            .await?;
-        if maintenance {
-            // Rows for repositories the fixup now ignores (scratch repos from
-            // before this rule, or newly configured globs) are forgotten here.
-            let ignore = self.untraced_fixup_ignore()?;
-            if let Some(count) = self
-                .with_repo_family_store(move |store| {
-                    let forgotten: Vec<String> = store
-                        .known_families(true)?
-                        .into_iter()
-                        .filter(|family| ignore.ignores(family))
-                        .collect();
-                    store.forget_families(&forgotten)?;
-                    store.prune(now_secs)?;
-                    store.family_count()
-                })
-                .await?
-            {
-                self.known_repo_families
-                    .store(count as u64, Ordering::Relaxed);
-            }
-        }
-        Ok(schedule)
-    }
-
-    /// Schedules one fixup pass per worktree of the given repository (or of
-    /// every family this daemon knows) and returns how many were scheduled.
-    async fn schedule_untraced_commit_scans(
-        self: &Arc<Self>,
-        repo_working_dir: Option<String>,
-        trigger: UntracedScanTrigger,
-    ) -> Result<UntracedScanSchedule, GitAiError> {
-        let now_secs = crate::utils::unix_timestamp_now();
-        let mut targets = Vec::new();
-        let mut ignored = 0;
-        match repo_working_dir {
-            Some(dir) => {
-                // The whole family: every worktree of the repository, with the
-                // named one included even when enumeration cannot see it.
-                let family = self.backend.resolve_family(Path::new(&dir))?;
-                if self.untraced_fixup_ignore()?.ignores(&family.0) {
-                    return Ok(UntracedScanSchedule {
-                        ignored: 1,
-                        ..UntracedScanSchedule::default()
-                    });
-                }
-                let worktree = worktree_root_for_path(Path::new(&dir)).ok_or_else(|| {
-                    GitAiError::Generic(format!("{dir} is not inside a git worktree"))
-                })?;
-                let git_dir = git_dir_for_worktree(&worktree)
-                    .ok_or_else(|| GitAiError::Generic(format!("{dir} has no git directory")))?;
-                for (git_dir, worktree) in worktrees_for_common_dir(Path::new(&family.0)) {
-                    targets.push((family.0.clone(), git_dir, worktree));
-                }
-                if !targets.iter().any(|(_, known, _)| *known == git_dir) {
-                    targets.push((family.0, git_dir, worktree));
-                }
-            }
-            None => {
-                // Families this process has heard from, plus those remembered
-                // from earlier daemon lifetimes. Routine ticks work from an
-                // in-memory copy of the remembered list and skip families
-                // already found missing; a maintenance round (hourly, and any
-                // explicit request) re-reads the store, re-probes missing
-                // families and refreshes `last_seen_at` for the present ones so
-                // an idle-but-present repository is never pruned as unseen.
-                let maintenance = !matches!(
-                    trigger,
-                    UntracedScanTrigger::Tick {
-                        maintenance: false,
-                        ..
-                    }
-                );
-                if maintenance {
-                    // Config edits (new globs, flag flips) apply from here on.
-                    *self.untraced_fixup_ignore.lock().map_err(|_| {
-                        GitAiError::Generic("untraced fixup ignore lock poisoned".to_string())
-                    })? = crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore::from_config(
-                        &config::Config::fresh(),
-                    );
-                }
-                let ignore = self.untraced_fixup_ignore()?;
-                let mut families = self.coordinator.family_keys().await;
-                families.extend(self.remembered_families(maintenance).await?);
-                families.sort();
-                families.dedup();
-                if let UntracedScanTrigger::Tick {
-                    rotation,
-                    maintenance: false,
-                } = trigger
-                    && families.len() > UNTRACED_FIXUP_MAX_FAMILIES_PER_TICK
-                {
-                    // A routine tick looks at a rotating window of families so
-                    // its filesystem work stays bounded however many the daemon
-                    // has heard of; every family comes up within a few ticks. A
-                    // maintenance round (hourly) looks at all of them, so every
-                    // present family is marked seen before pruning runs.
-                    let start =
-                        (rotation as usize * UNTRACED_FIXUP_MAX_FAMILIES_PER_TICK) % families.len();
-                    families.rotate_left(start);
-                    families.truncate(UNTRACED_FIXUP_MAX_FAMILIES_PER_TICK);
-                }
-                let known_missing = if maintenance {
-                    self.lock_untraced_missing_families()?.clear();
-                    HashSet::new()
-                } else {
-                    self.lock_untraced_missing_families()?.clone()
-                };
-                for family in families {
-                    if known_missing.contains(&family) {
-                        continue;
-                    }
-                    // Scratch repositories (temp roots, configured globs) are
-                    // dropped before the stat and before any store write.
-                    if ignore.ignores(&family) {
-                        ignored += 1;
-                        continue;
-                    }
-                    let common_dir = Path::new(&family);
-                    if !common_dir.is_dir() {
-                        self.lock_untraced_missing_families()?
-                            .insert(family.clone());
-                        self.with_repo_family_store(move |store| {
-                            store.record_family_missing(&family, now_secs)
-                        })
-                        .await?;
-                        continue;
-                    }
-                    // Present families the store already remembers stay
-                    // fresh; a family is first remembered only by a completed
-                    // pass, together with its cursor.
-                    if maintenance {
-                        let family = family.clone();
-                        self.with_repo_family_store(move |store| {
-                            store.refresh_family_seen(&family, now_secs)
-                        })
-                        .await?;
-                    }
-                    for (git_dir, worktree) in self.family_worktrees(&family).await? {
-                        targets.push((family.clone(), git_dir, worktree));
-                    }
-                }
-            }
-        }
-        if let UntracedScanTrigger::Tick { rotation, .. } = trigger
-            && !targets.is_empty()
-        {
-            // Later worktrees are not starved when more than a tick's worth
-            // of them changed at once.
-            let len = targets.len();
-            targets.rotate_left((rotation as usize) % len);
-        }
-        let mut schedule = UntracedScanSchedule {
-            ignored,
-            ..UntracedScanSchedule::default()
-        };
-        let mut families = HashSet::new();
-        for (family, git_dir, worktree) in targets {
-            if self.family_has_pending_untraced_scan(&family, &git_dir)? {
-                continue;
-            }
-            let max_offset = head_reflog_len(&git_dir);
-            // A pass that runs records the family and its cursor when it
-            // completes; ticks only read, and only the first time they see a
-            // worktree (the cache mirrors every later write).
-            let git_dir_key = git_dir.to_string_lossy().to_string();
-            let cached = match self.cached_untraced_cursor(&git_dir_key) {
-                Some(cached) => cached,
-                None => {
-                    let key = git_dir_key.clone();
-                    let cached = CachedUntracedCursor {
-                        cursor: self
-                            .with_repo_family_store(move |store| store.cursor(&key))
-                            .await?
-                            .flatten(),
-                        reflog_seen: None,
-                    };
-                    self.cache_untraced_cursor(&git_dir_key, cached.clone());
-                    cached
-                }
-            };
-            let seed = cached.cursor;
-            if matches!(trigger, UntracedScanTrigger::Tick { .. }) {
-                if head_reflog_unchanged_since(&git_dir, seed.as_ref(), cached.reflog_seen.as_ref())
-                {
-                    schedule.unchanged += 1;
-                    continue;
-                }
-                if schedule.worktrees >= UNTRACED_FIXUP_MAX_SCANS_PER_TICK
-                    || self.family_has_open_mutating_root(&family)?
-                {
-                    schedule.deferred += 1;
-                    continue;
-                }
-            }
-            self.append_family_sequencer_entry(
-                &family,
-                now_unix_nanos(),
-                FamilySequencerEntry::UntracedCommitScan {
-                    git_dir,
-                    worktree,
-                    seed,
-                    max_offset,
-                },
-            )?;
-            schedule.worktrees += 1;
-            if families.insert(family.clone()) {
-                self.schedule_family_drain(family);
-            }
-        }
-        schedule.families = families.len();
-        Ok(schedule)
-    }
-
-    /// Families remembered in the store: re-read on a maintenance round (and
-    /// then including families last seen missing), otherwise the copy taken at
-    /// the last round plus every family a pass has recorded since.
-    async fn remembered_families(&self, maintenance: bool) -> Result<Vec<String>, GitAiError> {
-        if !maintenance && let Some(cached) = self.lock_untraced_known_families()?.clone() {
-            return Ok(cached);
-        }
-        let ignore = self.untraced_fixup_ignore()?;
-        let remembered: Vec<String> = self
-            .with_repo_family_store(move |store| store.known_families(maintenance))
-            .await?
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|family| !ignore.ignores(family))
-            .collect();
-        *self.lock_untraced_known_families()? = Some(remembered.clone());
-        Ok(remembered)
-    }
-
-    fn lock_untraced_known_families(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<Vec<String>>>, GitAiError> {
-        self.untraced_known_families
-            .lock()
-            .map_err(|_| GitAiError::Generic("untraced known families lock poisoned".to_string()))
-    }
-
-    fn lock_untraced_missing_families(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashSet<String>>, GitAiError> {
-        self.untraced_missing_families
-            .lock()
-            .map_err(|_| GitAiError::Generic("untraced missing families lock poisoned".to_string()))
-    }
-
-    /// `Some` when this worktree's persisted cursor has been read or written
-    /// since the daemon started.
-    fn cached_untraced_cursor(&self, git_dir_key: &str) -> Option<CachedUntracedCursor> {
-        self.untraced_cursor_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(git_dir_key).cloned())
-    }
-
-    fn cache_untraced_cursor(&self, git_dir_key: &str, cached: CachedUntracedCursor) {
-        if let Ok(mut cache) = self.untraced_cursor_cache.lock() {
-            cache.insert(git_dir_key.to_string(), cached);
-        }
-    }
-
-    /// Whether a fixup pass for this worktree is already queued (a pass held
-    /// behind an open root must not pile up duplicates every tick).
-    fn family_has_pending_untraced_scan(
-        &self,
-        family: &str,
-        git_dir: &Path,
-    ) -> Result<bool, GitAiError> {
-        let sequencers = self
-            .family_sequencers_by_family
-            .lock()
-            .map_err(|_| GitAiError::Generic("family sequencer map lock poisoned".to_string()))?;
-        Ok(sequencers.get(family).is_some_and(|state| {
-            state.entries.values().any(|slot| {
-                matches!(
-                    &slot.entry,
-                    FamilySequencerEntry::UntracedCommitScan { git_dir: pending, .. }
-                        if pending == git_dir
-                )
-            })
-        }))
-    }
-
-    /// A snapshot of the fixup's ignore rules (cheap: a few paths and globs).
-    fn untraced_fixup_ignore(
-        &self,
-    ) -> Result<crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore, GitAiError> {
-        self.untraced_fixup_ignore
-            .lock()
-            .map(|ignore| ignore.clone())
-            .map_err(|_| GitAiError::Generic("untraced fixup ignore lock poisoned".to_string()))
-    }
-
-    fn untraced_persistence_blocked(&self, git_dir_key: &str) -> Result<bool, GitAiError> {
-        Ok(self
-            .lock_untraced_persistence_blocked()?
-            .contains(git_dir_key))
-    }
-
-    fn lock_untraced_persistence_blocked(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashSet<String>>, GitAiError> {
-        self.untraced_persistence_blocked.lock().map_err(|_| {
-            GitAiError::Generic("untraced persistence block set lock poisoned".to_string())
-        })
-    }
-
-    /// A family's worktrees: what the filesystem shows under its common dir,
-    /// plus worktrees remembered from earlier passes (the only way back to a
-    /// `--separate-git-dir` main worktree) that still exist.
-    async fn family_worktrees(&self, family: &str) -> Result<Vec<(PathBuf, PathBuf)>, GitAiError> {
-        let mut worktrees = worktrees_for_common_dir(Path::new(family));
-        let common_dir = family.to_string();
-        // A store problem must not take the whole tick down: the filesystem
-        // enumeration still covers every worktree the filesystem can lead to.
-        let remembered = self
-            .with_repo_family_store(move |store| store.known_worktrees(&common_dir))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, %family, "could not read remembered worktrees");
-                None
-            })
-            .unwrap_or_default();
-        for (git_dir, worktree) in remembered {
-            let (git_dir, worktree) = (PathBuf::from(git_dir), PathBuf::from(worktree));
-            // Either path may have been reused by an unrelated repository since;
-            // the worktree must still resolve to this git dir.
-            if worktree_belongs_to_git_dir(&worktree, &git_dir)
-                && !worktrees.iter().any(|(known, _)| *known == git_dir)
-            {
-                worktrees.push((git_dir, worktree));
-            }
-        }
-        Ok(worktrees)
-    }
-
-    /// Runs a store operation off the async runtime; `Ok(None)` when no store
-    /// is open.
-    async fn with_repo_family_store<T, F>(&self, operation: F) -> Result<Option<T>, GitAiError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&crate::daemon::repo_family_store::RepoFamilyStore) -> Result<T, GitAiError>
-            + Send
-            + 'static,
-    {
-        let Some(store) = self.repo_family_store.clone() else {
-            return Ok(None);
-        };
-        crate::tokio_runtime::spawn_blocking_result(move || operation(&store))
-            .await
-            .map(Some)
-    }
-
     fn side_effect_exec_lock(&self, family: &str) -> Result<Arc<AsyncMutex<()>>, GitAiError> {
         let mut map = self
             .side_effect_exec_locks
@@ -6105,9 +3640,6 @@ impl ActorDaemonCoordinator {
                     FamilySequencerEntry::Checkpoint { receipt_seq, .. } => {
                         format!("checkpoint:seq={receipt_seq}")
                     }
-                    FamilySequencerEntry::UntracedCommitScan { worktree, .. } => {
-                        format!("untraced_scan:{}", worktree.display())
-                    }
                 };
                 format!("order={order} entry={entry}")
             });
@@ -6125,15 +3657,11 @@ impl ActorDaemonCoordinator {
                     // does not kill the daemon process.
                     let side_effect_result = {
                         let future = async {
-                            let root_sid = command.root_sid.clone();
-                            let mut commit_file_timestamp_snapshots =
-                                self.take_cached_commit_file_timestamp_snapshots(&root_sid)?;
                             let applied = self.coordinator.route_command(*command).await?;
                             let side_effect = self
                                 .maybe_apply_side_effects_for_applied_command(
                                     Some(family),
                                     &applied,
-                                    &mut commit_file_timestamp_snapshots,
                                 )
                                 .await;
                             Ok::<_, GitAiError>((applied, side_effect))
@@ -6195,10 +3723,7 @@ impl ActorDaemonCoordinator {
                         }
                     }
                 }
-                FamilySequencerEntry::AppliedSideEffects {
-                    applied,
-                    mut commit_file_timestamp_snapshots,
-                } => {
+                FamilySequencerEntry::AppliedSideEffects { applied } => {
                     let _side_effect_permit = self
                         .command_side_effect_semaphore
                         .acquire()
@@ -6207,11 +3732,8 @@ impl ActorDaemonCoordinator {
                             GitAiError::Generic("command side-effect semaphore closed".to_string())
                         })?;
                     let side_effect_result = {
-                        let future = self.maybe_apply_side_effects_for_applied_command(
-                            Some(family),
-                            &applied,
-                            &mut commit_file_timestamp_snapshots,
-                        );
+                        let future = self
+                            .maybe_apply_side_effects_for_applied_command(Some(family), &applied);
                         let caught = std::panic::AssertUnwindSafe(future);
                         match futures::FutureExt::catch_unwind(caught).await {
                             Ok(result) => result,
@@ -6248,361 +3770,68 @@ impl ActorDaemonCoordinator {
                         );
                     }
                 }
-                FamilySequencerEntry::UntracedCommitScan {
-                    git_dir,
-                    worktree,
-                    seed,
-                    max_offset,
-                } => {
-                    let _side_effect_permit = self
-                        .command_side_effect_semaphore
-                        .acquire()
-                        .await
-                        .map_err(|_| {
-                            GitAiError::Generic("command side-effect semaphore closed".to_string())
-                        })?;
-                    // The rules may have started ignoring this family after the
-                    // pass was queued (a config change, a maintenance refresh).
-                    if self.untraced_fixup_ignore()?.ignores(family) {
-                        tracing::debug!(%family, "untraced fixup pass skipped: family is ignored");
-                        continue;
-                    }
-                    let git_dir_key = git_dir.to_string_lossy().to_string();
-                    let worktree_key = worktree.to_string_lossy().to_string();
-                    let scan = self
-                        .run_untraced_commit_scan(
-                            family, git_dir, worktree, seed, max_offset, order,
-                        )
-                        .await;
-                    let persisted = match scan {
-                        Ok(Some(cursor))
-                            if !self.untraced_persistence_blocked(&git_dir_key)?
-                                && !self.untraced_fixup_ignore()?.ignores(family) =>
-                        {
-                            let family = family.to_string();
-                            self.cache_untraced_cursor(
-                                &git_dir_key,
-                                CachedUntracedCursor {
-                                    cursor: Some(cursor.clone()),
-                                    reflog_seen: Some(observe_head_reflog(Path::new(&git_dir_key))),
-                                },
-                            );
-                            if let Ok(mut known) = self.untraced_known_families.lock()
-                                && let Some(known) = known.as_mut()
-                                && !known.contains(&family)
-                            {
-                                known.push(family.clone());
-                            }
-                            let known = self
-                                .with_repo_family_store(move |store| {
-                                    store.record_pass_completed(
-                                        &family,
-                                        &git_dir_key,
-                                        &worktree_key,
-                                        &cursor,
-                                        crate::utils::unix_timestamp_now(),
-                                    )?;
-                                    store.family_count()
-                                })
-                                .await;
-                            known.map(|count| {
-                                if let Some(count) = count {
-                                    self.known_repo_families
-                                        .store(count as u64, Ordering::Relaxed);
-                                }
-                            })
-                        }
-                        // A side effect failed in this or an earlier pass: the
-                        // durable cursor stays behind that commit for the rest
-                        // of this daemon lifetime, so the next one retries it
-                        // (commits that did get their note are skipped then).
-                        // The in-memory position still moves so ticks keep
-                        // gating on it.
-                        Ok(Some(cursor)) => {
-                            self.cache_untraced_cursor(
-                                &git_dir_key,
-                                CachedUntracedCursor {
-                                    cursor: Some(cursor),
-                                    reflog_seen: Some(observe_head_reflog(Path::new(&git_dir_key))),
-                                },
-                            );
-                            Ok(())
-                        }
-                        Ok(None) => self.lock_untraced_persistence_blocked().map(|mut blocked| {
-                            blocked.insert(git_dir_key);
-                        }),
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = persisted {
-                        self.untraced_scan_errors.fetch_add(1, Ordering::Relaxed);
-                        let _ = self.record_side_effect_error(family, order, &error);
-                        tracing::error!(%error, %family, order, "untraced commit scan failed");
-                    }
-                }
                 FamilySequencerEntry::Checkpoint {
-                    mut request,
+                    request,
                     receipt_seq,
                     reservation: _reservation,
                 } => {
-                    let repo_wd = request
-                        .files
-                        .first()
-                        .map(|f| f.repo_work_dir.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let checkpoint_file_paths: Vec<String> = request
-                        .files
-                        .iter()
-                        .map(|f| f.path.to_string_lossy().to_string())
-                        .collect();
-                    let checkpoint_kind = request.checkpoint_kind;
-                    let checkpoint_trace_id = request.trace_id.clone();
-                    let checkpoint_path_role = request.path_role;
-                    let checkpoint_has_agent = request.agent_id.is_some();
-                    let checkpoint_kind_str = format!("{:?}", checkpoint_kind);
-                    let is_human_checkpoint = checkpoint_kind == CheckpointKind::Human;
-
-                    // Register pending AI edit state when an AI agent fires its
-                    // pre-edit snapshot. This signals that an AI edit is in-flight.
-                    // Identified by: WillEdit path_role + agent_id present (only AI
-                    // agent presets have an agent_id on their pre-edit checkpoints).
-                    if checkpoint_path_role == PreparedPathRole::WillEdit && checkpoint_has_agent {
-                        self.register_pending_ai_edits(family, &checkpoint_file_paths);
-                    }
-
-                    // Filter out files with pending AI edits from KnownHuman checkpoints.
-                    // These are spurious IDE save events that fire between pre/post-edit.
-                    if checkpoint_kind == CheckpointKind::KnownHuman {
-                        let pending_files: Vec<String> = checkpoint_file_paths
-                            .iter()
-                            .filter(|f| self.file_has_pending_ai_edit(family, f))
-                            .cloned()
-                            .collect();
-                        if !pending_files.is_empty() {
-                            request.files.retain(|f| {
-                                let path_str = f.path.to_string_lossy().to_string();
-                                !pending_files.contains(&path_str)
-                            });
-                            tracing::debug!(
-                                "[KnownHuman] Filtered {} file(s) with pending AI edits",
-                                pending_files.len()
-                            );
-                            if request.files.is_empty() {
-                                let log_entry = TestCompletionLogEntry {
-                                    seq: 0,
-                                    family_key: family.to_string(),
-                                    kind: "checkpoint".to_string(),
-                                    primary_command: Some("checkpoint".to_string()),
-                                    test_sync_session: None,
-                                    exit_code: None,
-                                    sync_tracked: true,
-                                    status: "suppressed".to_string(),
-                                    error: None,
-                                };
-                                let _ = self.maybe_append_test_completion_log(family, &log_entry);
-                                tracing::info!(
-                                    component = "daemon",
-                                    phase = "checkpoint_processing",
-                                    receipt_seq,
-                                    trace_id = %checkpoint_trace_id,
-                                    %family,
-                                    status = "suppressed",
-                                    "checkpoint processing completed"
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Recompute file paths after potential KnownHuman filtering so
-                    // watermark computation and clear_pending_ai_edits use the actual
-                    // files that will be checkpointed.
-                    let checkpoint_file_paths: Vec<String> = request
-                        .files
-                        .iter()
-                        .map(|f| f.path.to_string_lossy().to_string())
-                        .collect();
-
-                    let should_log_completion = true; // Always log for test sync
-                    tracing::info!(kind = %checkpoint_kind_str, repo = %repo_wd, "checkpoint start");
-                    let checkpoint_side_effect_permit = self
+                    let worktree = request.repo_working_dir.clone();
+                    let request_id = request.request_id.clone();
+                    let started = Instant::now();
+                    let runtime = Arc::clone(&self.link_checkpoints);
+                    let _permit = self
                         .checkpoint_side_effect_semaphore
                         .acquire()
                         .await
                         .map_err(|_| {
-                            GitAiError::Generic(
-                                "checkpoint side-effect semaphore closed".to_string(),
-                            )
+                            GitAiError::Generic("checkpoint side-effect semaphore closed".into())
                         })?;
-                    let checkpoint_start = std::time::Instant::now();
-                    let checkpoint_request = {
-                        let future = async {
-                            if !repo_wd.is_empty() {
-                                let ack =
-                                    self.coordinator.apply_checkpoint(Path::new(&repo_wd)).await;
-                                match ack {
-                                    Ok(ack) => {
-                                        crate::tokio_runtime::spawn_blocking_result(move || {
-                                            apply_checkpoint_side_effect(*request)
-                                        })
-                                        .await
-                                        .map(|_| ack.seq)
-                                    }
-                                    Err(error) => Err(error),
+                    let result = async {
+                        let ack = self.coordinator.apply_checkpoint(&worktree).await?;
+                        tokio::task::spawn_blocking(move || {
+                            #[cfg(feature = "test-support")]
+                            {
+                                wait_at_checkpoint_test_barrier(&request.request_id)?;
+                                if let Some(delay) = checkpoint_test_delay(
+                                    "GIT_AI_TEST_DELAY_CHECKPOINT_SIDE_EFFECT",
+                                    &request.request_id,
+                                ) {
+                                    std::thread::sleep(delay);
                                 }
-                            } else {
-                                crate::tokio_runtime::spawn_blocking_result(move || {
-                                    apply_checkpoint_side_effect(*request)
-                                })
-                                .await
-                                .map(|_| 0)
+                                if std::env::var("GIT_AI_TEST_FAIL_CHECKPOINT_SIDE_EFFECT")
+                                    .is_ok_and(|id| id == request.request_id)
+                                {
+                                    return Err(GitAiError::Generic(
+                                        "synthetic checkpoint processing failure".into(),
+                                    ));
+                                }
                             }
-                        };
-                        let caught = std::panic::AssertUnwindSafe(future);
-                        futures::FutureExt::catch_unwind(caught).await
-                    };
-                    let result = match checkpoint_request {
-                        Ok(inner) => inner,
-                        Err(panic_payload) => {
-                            let panic_msg = panic_payload_message(panic_payload.as_ref());
-                            tracing::error!(
-                                component = "daemon",
-                                phase = "checkpoint_side_effect",
-                                reason = "panic_in_side_effect",
-                                panic_msg = %panic_msg,
-                                %family,
-                                order,
-                                "checkpoint side effect panic"
-                            );
-                            Err(GitAiError::Generic(format!(
-                                "daemon checkpoint panic: {}",
-                                panic_msg
-                            )))
-                        }
-                    };
-                    drop(checkpoint_side_effect_permit);
-                    let checkpoint_duration_ms = checkpoint_start.elapsed().as_millis();
-                    if result.is_ok() {
-                        tracing::info!(
-                            kind = %checkpoint_kind_str,
-                            repo = %repo_wd,
-                            duration_ms = checkpoint_duration_ms as u64,
-                            "checkpoint done"
-                        );
-                    } else {
-                        tracing::warn!(
-                            kind = %checkpoint_kind_str,
-                            repo = %repo_wd,
-                            duration_ms = checkpoint_duration_ms as u64,
-                            "checkpoint failed"
-                        );
+                            runtime.apply(*request)
+                        })
+                        .await
+                        .map_err(|error| GitAiError::Generic(error.to_string()))??;
+                        Ok::<_, GitAiError>(ack.seq)
                     }
-                    if result.is_ok() {
-                        // Clear pending AI edit state once the PostFileEdit completes.
-                        if checkpoint_kind.is_ai()
-                            && checkpoint_path_role == PreparedPathRole::Edited
-                        {
-                            self.clear_pending_ai_edits(family, &checkpoint_file_paths);
-                        }
-                        let per_file = if !checkpoint_file_paths.is_empty() {
-                            compute_watermarks_from_stat(&repo_wd, &checkpoint_file_paths)
-                        } else {
-                            std::collections::HashMap::new()
-                        };
-                        let per_worktree = if is_human_checkpoint {
-                            let now_ns = std::time::SystemTime::now()
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            std::collections::HashMap::from([(
-                                Self::worktree_state_key(Path::new(&repo_wd)),
-                                now_ns,
-                            )])
-                        } else {
-                            std::collections::HashMap::new()
-                        };
-                        if (!per_file.is_empty() || !per_worktree.is_empty())
-                            && let Err(error) = self
-                                .coordinator
-                                .update_watermarks_family(
-                                    Path::new(&repo_wd),
-                                    crate::daemon::domain::WatermarkState {
-                                        per_file,
-                                        per_worktree,
-                                    },
-                                )
-                                .await
-                        {
-                            let _ = self.record_side_effect_error(family, order, &error);
-                            tracing::error!(
-                                component = "daemon",
-                                phase = "checkpoint_processing",
-                                reason = "watermark_update_failed",
-                                receipt_seq,
-                                %family,
-                                order,
-                                %error,
-                                "checkpoint watermark update failed"
-                            );
-                        }
-                    }
-                    // Removed captured_checkpoint_id cleanup - no more captured checkpoints
+                    .await;
                     if let Err(error) = &result {
                         let _ = self.record_side_effect_error(family, order, error);
-                        tracing::error!(
-                            component = "daemon",
-                            phase = "checkpoint_processing",
-                            reason = "side_effect_failed",
-                            receipt_seq,
-                            trace_id = %checkpoint_trace_id,
-                            %error,
-                            %family,
-                            order,
-                            "checkpoint side effect failed"
-                        );
+                        tracing::error!(component = "daemon", phase = "checkpoint_processing", reason = "side_effect_failed", %error, %family, receipt_seq, trace_id = %request_id, "checkpoint side effect failed");
                     }
-                    if should_log_completion {
-                        let log_entry = TestCompletionLogEntry {
-                            seq: result.as_ref().copied().unwrap_or(0),
-                            family_key: family.to_string(),
-                            kind: "checkpoint".to_string(),
-                            primary_command: Some("checkpoint".to_string()),
-                            test_sync_session: None,
-                            exit_code: None,
-                            sync_tracked: true,
-                            status: if result.is_ok() {
-                                "ok".to_string()
-                            } else {
-                                "error".to_string()
-                            },
-                            error: result.as_ref().err().map(|error| error.to_string()),
-                        };
-                        if let Err(error) =
-                            self.maybe_append_test_completion_log(family, &log_entry)
-                        {
-                            let _ = self.record_side_effect_error(family, order, &error);
-                            tracing::error!(
-                                component = "daemon",
-                                phase = "checkpoint_processing",
-                                reason = "completion_log_failed",
-                                receipt_seq,
-                                trace_id = %checkpoint_trace_id,
-                                %error,
-                                %family,
-                                order,
-                                "checkpoint completion log write failed"
-                            );
-                        }
-                    }
-                    tracing::info!(
-                        component = "daemon",
-                        phase = "checkpoint_processing",
-                        receipt_seq,
-                        trace_id = %checkpoint_trace_id,
-                        %family,
-                        status = if result.is_ok() { "ok" } else { "error" },
-                        duration_ms = checkpoint_duration_ms as u64,
-                        "checkpoint processing completed"
-                    );
+                    let entry = TestCompletionLogEntry {
+                        seq: result.as_ref().copied().unwrap_or(0),
+                        family_key: family.into(),
+                        kind: "checkpoint".into(),
+                        primary_command: Some("checkpoint".into()),
+                        test_sync_session: None,
+                        exit_code: None,
+                        sync_tracked: true,
+                        status: if result.is_ok() { "ok" } else { "error" }.into(),
+                        error: result.as_ref().err().map(ToString::to_string),
+                    };
+                    self.maybe_append_test_completion_log(family, &entry)?;
+                    tracing::info!(component = "daemon", phase = "checkpoint_processing", receipt_seq, trace_id = %request_id, %family,
+                        status = if result.is_ok() { "ok" } else { "error" }, duration_ms = started.elapsed().as_millis() as u64,
+                        "checkpoint processing completed");
                 }
             }
         }
@@ -6619,1514 +3848,43 @@ impl ActorDaemonCoordinator {
             .to_string()
     }
 
-    fn set_pending_rebase_original_head_for_worktree(
-        &self,
-        worktree: &Path,
-        original_head: String,
-        onto: Option<String>,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_rebase_original_head_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending rebase original-head map lock poisoned".to_string())
-            })?;
-        map.insert(
-            Self::worktree_state_key(worktree),
-            PendingRebase {
-                original_head,
-                onto,
-            },
-        );
-        Ok(())
-    }
-
-    fn clear_pending_rebase_original_head_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_rebase_original_head_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending rebase original-head map lock poisoned".to_string())
-            })?;
-        map.remove(&Self::worktree_state_key(worktree));
-        Ok(())
-    }
-
-    fn take_pending_rebase_original_head_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<PendingRebase>, GitAiError> {
-        let mut map = self
-            .pending_rebase_original_head_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending rebase original-head map lock poisoned".to_string())
-            })?;
-        Ok(map.remove(&Self::worktree_state_key(worktree)))
-    }
-
-    fn set_pending_cherry_pick_sources_for_worktree(
-        &self,
-        worktree: &Path,
-        sources: Vec<String>,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_sources_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick sources map lock poisoned".to_string())
-            })?;
-        let key = Self::worktree_state_key(worktree);
-        if sources.is_empty() {
-            map.remove(&key);
-        } else {
-            map.insert(key, sources);
-        }
-        Ok(())
-    }
-
-    fn clear_pending_cherry_pick_sources_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_sources_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick sources map lock poisoned".to_string())
-            })?;
-        map.remove(&Self::worktree_state_key(worktree));
-        Ok(())
-    }
-
-    fn take_pending_cherry_pick_sources_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<Vec<String>, GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_sources_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick sources map lock poisoned".to_string())
-            })?;
-        Ok(map
-            .remove(&Self::worktree_state_key(worktree))
-            .unwrap_or_default())
-    }
-
-    fn pending_cherry_pick_sources_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<Vec<String>, GitAiError> {
-        let map = self
-            .pending_cherry_pick_sources_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick sources map lock poisoned".to_string())
-            })?;
-        Ok(map
-            .get(&Self::worktree_state_key(worktree))
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    fn set_pending_cherry_pick_no_commit_for_worktree(
-        &self,
-        worktree: &Path,
-        source_commits: Vec<String>,
-        head: String,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_no_commit_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick no-commit map lock poisoned".to_string())
-            })?;
-        let key = Self::worktree_state_key(worktree);
-        if source_commits.is_empty() || head.is_empty() {
-            map.remove(&key);
-        } else {
-            map.insert(
-                key,
-                PendingCherryPickNoCommit {
-                    source_commits,
-                    head,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn clear_pending_cherry_pick_no_commit_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<(), GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_no_commit_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick no-commit map lock poisoned".to_string())
-            })?;
-        map.remove(&Self::worktree_state_key(worktree));
-        Ok(())
-    }
-
-    fn take_pending_cherry_pick_no_commit_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<PendingCherryPickNoCommit>, GitAiError> {
-        let mut map = self
-            .pending_cherry_pick_no_commit_by_worktree
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic("pending cherry-pick no-commit map lock poisoned".to_string())
-            })?;
-        Ok(map.remove(&Self::worktree_state_key(worktree)))
-    }
-
-    fn set_pending_squash_merge_for_worktree(
-        &self,
-        worktree: &Path,
-        source_head: String,
-        onto: String,
-    ) -> Result<(), GitAiError> {
-        let mut map = self.pending_squash_merge_by_worktree.lock().map_err(|_| {
-            GitAiError::Generic("pending squash merge map lock poisoned".to_string())
-        })?;
-        map.insert(
-            Self::worktree_state_key(worktree),
-            PendingSquashMerge { source_head, onto },
-        );
-        Ok(())
-    }
-
-    fn take_pending_squash_merge_for_worktree(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<PendingSquashMerge>, GitAiError> {
-        let mut map = self.pending_squash_merge_by_worktree.lock().map_err(|_| {
-            GitAiError::Generic("pending squash merge map lock poisoned".to_string())
-        })?;
-        Ok(map.remove(&Self::worktree_state_key(worktree)))
-    }
-
-    fn resolve_heads_for_command(
-        cmd: &crate::daemon::domain::NormalizedCommand,
-    ) -> (String, String) {
-        let old = cmd
-            .ref_changes
-            .iter()
-            .find(|change| change.reference == "HEAD")
-            .map(|change| change.old.clone())
-            .or_else(|| {
-                cmd.ref_changes
-                    .iter()
-                    .find(|change| change.reference.starts_with("refs/heads/"))
-                    .map(|change| change.old.clone())
-            })
-            .or_else(|| {
-                cmd.ref_changes
-                    .iter()
-                    .find(|change| is_non_auxiliary_ref(&change.reference))
-                    .map(|change| change.old.clone())
-            })
-            .unwrap_or_default();
-        let new = cmd
-            .ref_changes
-            .iter()
-            .rfind(|change| change.reference == "HEAD")
-            .map(|change| change.new.clone())
-            .or_else(|| {
-                cmd.ref_changes
-                    .iter()
-                    .rfind(|change| change.reference.starts_with("refs/heads/"))
-                    .map(|change| change.new.clone())
-            })
-            .or_else(|| {
-                cmd.ref_changes
-                    .iter()
-                    .rfind(|change| is_non_auxiliary_ref(&change.reference))
-                    .map(|change| change.new.clone())
-            })
-            .unwrap_or_default();
-        (old, new)
-    }
-
-    fn stash_pathspecs_from_command(cmd: &crate::daemon::domain::NormalizedCommand) -> Vec<String> {
-        let parsed = parsed_invocation_for_normalized_command(cmd);
-        if parsed.command.as_deref() != Some("stash") {
-            return Vec::new();
-        }
-
-        let mut pathspecs = Vec::new();
-        let mut found_separator = false;
-        let mut skip_next = false;
-
-        for (i, arg) in parsed.command_args.iter().enumerate() {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if arg == "--" {
-                found_separator = true;
-                continue;
-            }
-            if found_separator {
-                pathspecs.push(arg.clone());
-                continue;
-            }
-            if arg.starts_with('-') {
-                if matches!(
-                    arg.as_str(),
-                    "-m" | "--message" | "--pathspec-from-file" | "--pathspec-file-nul"
-                ) {
-                    skip_next = true;
-                }
-                continue;
-            }
-            if i == 0 && matches!(arg.as_str(), "push" | "save" | "pop" | "apply") {
-                continue;
-            }
-            if i == 1 && arg.starts_with("stash@") {
-                continue;
-            }
-            pathspecs.push(arg.clone());
-        }
-
-        tracing::debug!("Extracted stash pathspecs: {:?}", pathspecs);
-        pathspecs
-    }
-
-    /// Detects non-fast-forward ref moves and fires handle_rewrite_event.
-    fn detect_and_handle_non_ff_rewrites(
-        &self,
-        cmd: &crate::daemon::domain::NormalizedCommand,
-    ) -> Result<(), GitAiError> {
-        let worktree = match cmd.worktree.as_ref() {
-            Some(w) => w,
-            None => return Ok(()),
-        };
-
-        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-
-        // For rebase --skip/--continue that completes successfully, the trace2 data only shows
-        // HEAD moving from onto → new_tip (a fast-forward). The real old_tip (original branch tip
-        // before rebase started) was stored when the initial rebase failed. Use it here.
-        let is_rebase_cmd = cmd.primary_command.as_deref() == Some("rebase");
-        let pending_original_head = if is_rebase_cmd {
-            self.take_pending_rebase_original_head_for_worktree(worktree)?
-        } else {
-            None
-        };
-
-        // Collect branch ref changes (skip notes, tags, etc.)
-        let mut branch_changes: Vec<_> = cmd
-            .ref_changes
-            .iter()
-            .filter(|rc| rc.reference.starts_with("refs/heads/"))
-            .filter(|rc| is_valid_oid(&rc.old) && !is_zero_oid(&rc.old))
-            .filter(|rc| is_valid_oid(&rc.new) && !is_zero_oid(&rc.new))
-            .cloned()
-            .collect();
-
-        // If no branch ref changes found, fall back to HEAD changes (common for reset)
-        if branch_changes.is_empty() {
-            let head_changes: Vec<_> = cmd
-                .ref_changes
-                .iter()
-                .filter(|rc| rc.reference == "HEAD")
-                .filter(|rc| is_valid_oid(&rc.old) && !is_zero_oid(&rc.old))
-                .filter(|rc| is_valid_oid(&rc.new) && !is_zero_oid(&rc.new))
-                .cloned()
-                .collect();
-            if !head_changes.is_empty() {
-                branch_changes = head_changes;
-            }
-        }
-
-        if branch_changes.is_empty() && pending_original_head.is_none() {
-            return Ok(());
-        }
-
-        // Collapse multiple changes to same branch: use (first old, last new)
-        let mut collapsed: std::collections::HashMap<&str, (&str, &str)> =
-            std::collections::HashMap::new();
-        for rc in &branch_changes {
-            collapsed
-                .entry(rc.reference.as_str())
-                .and_modify(|(_old, new)| *new = &rc.new)
-                .or_insert((&rc.old, &rc.new));
-        }
-
-        // Lite mode keeps working logs aligned with the final ref tips, but does not
-        // inspect the commit graph or migrate authorship notes. Everything needed for
-        // this bookkeeping comes from the already-normalized trace2/ref transition.
-        if config::Config::get().get_feature_flags().lite_mode {
-            if let Some(pending) = pending_original_head.as_ref()
-                && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
-            {
-                if pending.original_head != new_tip {
-                    repo.storage
-                        .rename_working_log(&pending.original_head, &new_tip)?;
-                }
-                return Ok(());
-            }
-            if !matches!(
-                cmd.primary_command.as_deref(),
-                Some("rebase" | "pull" | "update-ref")
-            ) {
-                return Ok(());
-            }
-            let command_moves_checked_out_history =
-                matches!(cmd.primary_command.as_deref(), Some("rebase" | "pull"));
-            let mut collapsed_head: Option<(&str, &str)> = None;
-            for change in cmd.ref_changes.iter().filter(|change| {
-                change.reference == "HEAD"
-                    && is_valid_oid(&change.old)
-                    && !is_zero_oid(&change.old)
-                    && is_valid_oid(&change.new)
-                    && !is_zero_oid(&change.new)
-            }) {
-                if let Some((_old, new)) = &mut collapsed_head {
-                    *new = &change.new;
-                } else {
-                    collapsed_head = Some((&change.old, &change.new));
-                }
-            }
-            for (old_tip, new_tip) in collapsed.values() {
-                let moves_head = command_moves_checked_out_history
-                    || collapsed_head.is_some_and(|(head_old, head_new)| {
-                        head_old == *old_tip && head_new == *new_tip
-                    });
-                if old_tip != new_tip && moves_head {
-                    repo.storage.rename_working_log(old_tip, new_tip)?;
-                }
-            }
-            return Ok(());
-        }
-
-        // Extract "onto" hint from HEAD ref changes for rebases.
-        // During a rebase, the first HEAD change target is the onto commit.
-        let onto_hint: Option<String> = cmd
-            .ref_changes
-            .iter()
-            .filter(|rc| rc.reference == "HEAD")
-            .filter(|rc| is_valid_oid(&rc.new) && !is_zero_oid(&rc.new))
-            .map(|rc| rc.new.clone())
-            .next();
-
-        // If we have a pending original head from a failed rebase, use it as old_tip
-        // with the branch ref update as new_tip. This handles rebase --skip/--continue
-        // where HEAD can contain extra checkout/detach movement that is not the
-        // rebased branch tip.
-        crate::wltrace::wltrace(
-            "rewrite.branch_transition",
-            Path::new(cmd.worktree.as_deref().unwrap_or(Path::new(""))),
-            || {
-                format!(
-                    "cmd={} branch_changes={} pending_original_head={} ref_changes={}",
-                    cmd.primary_command.as_deref().unwrap_or("unknown"),
-                    branch_changes.len(),
-                    pending_original_head
-                        .as_ref()
-                        .map(|pending| pending.original_head.as_str())
-                        .unwrap_or("NONE"),
-                    cmd.ref_changes.len(),
-                )
-            },
-        );
-
-        if let Some(pending) = pending_original_head
-            && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
-        {
-            if pending.original_head != new_tip
-                && !is_ancestor_commit(&repo, &pending.original_head, &new_tip)
-            {
-                let command_rebase_onto =
-                    rebase_onto_from_command(cmd, &repo, &pending.original_head, &new_tip);
-                let rebase_onto = pending
-                    .onto
-                    .filter(|onto| {
-                        onto != &pending.original_head
-                            && onto != &new_tip
-                            && is_ancestor_commit(&repo, onto, &new_tip)
-                    })
-                    .or(command_rebase_onto);
-                let outcome =
-                    crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
-                        &repo,
-                        &pending.original_head,
-                        &new_tip,
-                        rebase_onto.as_deref(),
-                        crate::authorship::rewrite::RewriteMetricOperation::Rebase,
-                    )?;
-                repo.storage
-                    .rename_working_log(&pending.original_head, &new_tip)?;
-                let conflict_base = rebase_onto.clone();
-                let metric_context = process_conflict_resolution_working_logs(
-                    &repo,
-                    &new_tip,
-                    conflict_base.as_deref(),
-                )?;
-                let metric_commits =
-                    rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
-                if !metric_commits.is_empty() {
-                    let branch = rewrite_metric_branch_for_transition(
-                        cmd,
-                        &pending.original_head,
-                        &new_tip,
-                        None,
-                    );
-                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                        &repo,
-                        rewrite_metric_commits_with_branch(metric_commits, branch),
-                    );
-                }
-            }
-            return Ok(());
-        }
-
-        for (reference, (old_tip, new_tip)) in &collapsed {
-            if *old_tip == *new_tip {
-                continue;
-            }
-
-            // Fast-forward — not a rewrite
-            if is_ancestor_commit(&repo, old_tip, new_tip) {
-                continue;
-            }
-
-            let rewrite_onto = if is_rebase_cmd {
-                rebase_onto_from_command(cmd, &repo, old_tip, new_tip).or_else(|| onto_hint.clone())
-            } else {
-                onto_hint.clone()
-            };
-            let outcome = if is_rebase_cmd {
-                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
-                    &repo,
-                    old_tip,
-                    new_tip,
-                    rewrite_onto.as_deref(),
-                    crate::authorship::rewrite::RewriteMetricOperation::Rebase,
-                )?
-            } else if cmd.primary_command.as_deref() == Some("update-ref") {
-                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
-                    &repo,
-                    old_tip,
-                    new_tip,
-                    rewrite_onto.as_deref(),
-                    crate::authorship::rewrite::RewriteMetricOperation::UpdateRef,
-                )?
-            } else {
-                crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
-                    &repo,
-                    old_tip,
-                    new_tip,
-                    rewrite_onto.as_deref(),
-                    crate::authorship::rewrite::RewriteMetricOperation::NonFastForward,
-                )?
-            };
-            repo.storage.rename_working_log(old_tip, new_tip)?;
-            let metric_context = if is_rebase_cmd {
-                let conflict_base = rewrite_onto.clone().or_else(|| onto_hint.clone());
-                process_conflict_resolution_working_logs(&repo, new_tip, conflict_base.as_deref())?
-            } else {
-                RewriteMetricContext::default()
-            };
-            let metric_commits =
-                rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
-            if !metric_commits.is_empty() {
-                let branch =
-                    rewrite_metric_branch_for_transition(cmd, old_tip, new_tip, Some(reference));
-                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                    &repo,
-                    rewrite_metric_commits_with_branch(metric_commits, branch),
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn start_commit_file_timestamp_snapshots_for_command(
-        command: &crate::daemon::domain::NormalizedCommand,
-    ) -> CommitFileTimestampSnapshotHandles {
-        if config::Config::get().get_feature_flags().lite_mode
-            && command.primary_command.as_deref() == Some("commit")
-            && command.invoked_args.iter().any(|arg| arg == "--amend")
-        {
-            return HashMap::new();
-        }
-        let Some(worktree) = command.worktree.clone() else {
-            return HashMap::new();
-        };
-        if command.exit_code != 0 || command.primary_command.as_deref() != Some("commit") {
-            return HashMap::new();
-        }
-
-        let (_, new_head) = Self::resolve_heads_for_command(command);
-        if new_head.is_empty() || !is_valid_oid(&new_head) || is_zero_oid(&new_head) {
-            return HashMap::new();
-        }
-
-        let mut handles = HashMap::new();
-        let task_commit_sha = new_head.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            match capture_commit_file_timestamps(&worktree, &task_commit_sha) {
-                Ok(timestamps) => Some(timestamps),
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        commit_sha = %task_commit_sha,
-                        "failed to capture commit-time file timestamps"
-                    );
-                    None
-                }
-            }
-        });
-        handles.insert(new_head, handle);
-
-        handles
-    }
-
-    fn cache_commit_file_timestamp_snapshots_for_command(
-        &self,
-        command: &crate::daemon::domain::NormalizedCommand,
-    ) -> Result<(), GitAiError> {
-        let handles = Self::start_commit_file_timestamp_snapshots_for_command(command);
-        if handles.is_empty() {
-            return Ok(());
-        }
-        let mut cache = self
-            .commit_file_timestamp_snapshots_by_root
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic(
-                    "commit file timestamp snapshot cache lock poisoned".to_string(),
-                )
-            })?;
-        cache.insert(command.root_sid.clone(), handles);
-        Ok(())
-    }
-
-    fn take_cached_commit_file_timestamp_snapshots(
-        &self,
-        root_sid: &str,
-    ) -> Result<CommitFileTimestampSnapshotHandles, GitAiError> {
-        let mut cache = self
-            .commit_file_timestamp_snapshots_by_root
-            .lock()
-            .map_err(|_| {
-                GitAiError::Generic(
-                    "commit file timestamp snapshot cache lock poisoned".to_string(),
-                )
-            })?;
-        Ok(cache.remove(root_sid).unwrap_or_default())
-    }
-
-    async fn take_commit_file_timestamps(
-        handles: &mut CommitFileTimestampSnapshotHandles,
-        commit_sha: &str,
-    ) -> Option<crate::authorship::attribution_recovery::FileTimestampsByPath> {
-        let handle = handles.remove(commit_sha)?;
-        match tokio::time::timeout(COMMIT_FILE_TIMESTAMP_SNAPSHOT_WAIT, handle).await {
-            Ok(Ok(Some(timestamps))) if !timestamps.is_empty() => Some(timestamps),
-            Ok(Ok(_)) => None,
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    %error,
-                    %commit_sha,
-                    "commit-time file timestamp task failed"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::debug!(
-                    %commit_sha,
-                    "commit-time file timestamp task timed out"
-                );
-                None
-            }
-        }
-    }
-
     async fn maybe_apply_side_effects_for_applied_command(
         &self,
-        family: Option<&str>,
+        _family: Option<&str>,
         applied: &crate::daemon::domain::AppliedCommand,
-        commit_file_timestamp_snapshots: &mut CommitFileTimestampSnapshotHandles,
     ) -> Result<(), GitAiError> {
-        crate::otel::capture_operation(
-            applied.command.finished_at_ns,
-            self.apply_side_effects_for_applied_command(
-                family,
-                applied,
-                commit_file_timestamp_snapshots,
-            ),
-        )
-        .await
-    }
-
-    async fn apply_side_effects_for_applied_command(
-        &self,
-        family: Option<&str>,
-        applied: &crate::daemon::domain::AppliedCommand,
-        commit_file_timestamp_snapshots: &mut CommitFileTimestampSnapshotHandles,
-    ) -> Result<(), GitAiError> {
-        // Test-only: allow inducing a panic in the side-effect pipeline to verify
-        // that the daemon's catch_unwind recovery keeps the process alive.
-        // Uses a file-based flag so the test can remove the file between commands.
         #[cfg(feature = "test-support")]
-        if let Ok(path) = std::env::var("GIT_AI_TEST_PANIC_IN_SIDE_EFFECT_FLAG")
-            && std::path::Path::new(&path).exists()
         {
-            panic!("test-induced panic in side-effect pipeline");
-        }
-
-        let cmd = &applied.command;
-        let events = &applied.analysis.events;
-
-        let primary = cmd.primary_command.as_deref().unwrap_or("unknown");
-        let lite_mode = config::Config::get().get_feature_flags().lite_mode;
-
-        #[cfg(feature = "test-support")]
-        if let Ok(spec) = std::env::var("GIT_AI_TEST_DELAY_SIDE_EFFECT_MS_FOR_COMMAND") {
-            for entry in spec.split(',') {
-                let Some((command, delay_ms)) = entry.split_once('=') else {
-                    continue;
-                };
-                if command == primary
-                    && let Ok(delay_ms) = delay_ms.parse::<u64>()
-                    && delay_ms > 0
-                {
-                    // Lets tests poll for the grind having actually started
-                    // instead of guessing with fixed sleeps.
-                    tracing::info!(op = primary, delay_ms, "test side-effect delay started");
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    break;
-                }
-            }
-        }
-
-        let is_write_op = matches!(
-            primary,
-            "commit"
-                | "rebase"
-                | "merge"
-                | "cherry-pick"
-                | "am"
-                | "stash"
-                | "reset"
-                | "push"
-                | "update-ref"
-        );
-        if is_write_op && cmd.exit_code == 0 {
-            let repo_path = cmd
-                .worktree
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let post_head = cmd
-                .ref_changes
-                .iter()
-                .rev()
-                .find(|change| change.reference == "HEAD")
-                .map(|change| change.new.clone())
-                .unwrap_or_default();
-            tracing::info!(
-                op = primary,
-                repo = %repo_path,
-                new_head = %post_head,
-                "git write op completed"
-            );
-        }
-
-        let saw_pull_event = events.iter().any(|event| {
-            matches!(
-                event,
-                crate::daemon::domain::SemanticEvent::PullCompleted { .. }
-            )
-        });
-        let pull_uses_rebase = events.iter().any(|event| {
-            matches!(
-                event,
-                crate::daemon::domain::SemanticEvent::PullCompleted {
-                    strategy: crate::daemon::domain::PullStrategy::Rebase
-                        | crate::daemon::domain::PullStrategy::RebaseMerges,
-                    ..
-                }
-            )
-        });
-        if std::env::var("GIT_AI_DEBUG_DAEMON_TRACE")
-            .ok()
-            .as_deref()
-            .is_some_and(|v| v == "1")
-        {
-            tracing::debug!(
-                command = cmd.invoked_command.clone().unwrap_or_default(),
-                primary = cmd.primary_command.clone().unwrap_or_default(),
-                seq = applied.seq,
-                argv = ?cmd.raw_argv,
-                invoked_args = ?cmd.invoked_args,
-                ref_changes_len = cmd.ref_changes.len(),
-                ref_changes = ?cmd.ref_changes,
-                events = ?events,
-                exit_code = cmd.exit_code,
-                "side-effect trace"
-            );
-        }
-        // Non-FF rewrite detection: fires for commands that rewrite history via ref moves.
-        // Skip for: checkout/switch/branch (no rewriting), cherry-pick (handled separately),
-        // and plain commit/amend (CommitCreated/CommitAmended events handle those).
-        // Do NOT skip for rebase — the CommitCreated events during rebase are intermediate
-        // replayed commits; note transfer happens via non-FF detection on the final ref move.
-        // But DO skip for rebase --abort, which restores state instead of finishing a rewrite.
-        let is_rebase = cmd.primary_command.as_deref() == Some("rebase");
-        let is_rebase_abort = is_rebase && cmd.invoked_args.iter().any(|a| a == "--abort");
-        let is_completing_rebase = is_rebase && !is_rebase_abort;
-        let is_pull_rebase = pull_uses_rebase && cmd.primary_command.as_deref() == Some("pull");
-        let skip_non_ff = if is_completing_rebase || is_pull_rebase {
-            false
-        } else if is_rebase_abort {
-            if let Some(worktree) = cmd.worktree.as_ref() {
-                self.clear_pending_rebase_original_head_for_worktree(worktree)?;
-            }
-            true
-        } else {
-            events.iter().any(|event| {
-                matches!(
-                    event,
-                    crate::daemon::domain::SemanticEvent::CommitAmended { .. }
-                        | crate::daemon::domain::SemanticEvent::CommitCreated { .. }
-                        | crate::daemon::domain::SemanticEvent::CherryPickComplete { .. }
-                        | crate::daemon::domain::SemanticEvent::Reset { .. }
-                )
-            }) || matches!(
-                cmd.primary_command.as_deref(),
-                Some("checkout" | "switch" | "branch" | "stash")
-            )
-        };
-        if !skip_non_ff && cmd.exit_code == 0 {
-            self.detect_and_handle_non_ff_rewrites(cmd)?;
-        }
-
-        if cmd.exit_code != 0 {
-            let rebase_start = cmd
-                .ref_changes
-                .iter()
-                .find(|change| {
-                    change.reference == "HEAD"
-                        && is_valid_oid(&change.old)
-                        && !is_zero_oid(&change.old)
-                        && is_valid_oid(&change.new)
-                        && !is_zero_oid(&change.new)
-                })
-                .map(|change| (change.old.clone(), change.new.clone()));
-            let pull_has_rebase_start =
-                cmd.primary_command.as_deref() == Some("pull") && rebase_start.is_some();
-            let is_rebase_like = cmd.primary_command.as_deref() == Some("rebase")
-                || (cmd.primary_command.as_deref() == Some("pull")
-                    && (pull_uses_rebase || pull_has_rebase_start));
-            if is_rebase_like {
-                let worktree = cmd.worktree.as_ref().ok_or_else(|| {
-                    GitAiError::Generic(format!(
-                        "rebase side-effect state requires worktree sid={}",
-                        cmd.root_sid
-                    ))
-                })?;
-                if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
-                    self.clear_pending_rebase_original_head_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 && !rebase_is_control_mode(cmd) {
-                    let semantic_old_head = rebase_start
-                        .as_ref()
-                        .map(|(old, _)| old.as_str())
-                        .unwrap_or("");
-                    let pending_old_head =
-                        strict_rebase_original_head_from_command(cmd, semantic_old_head);
-                    crate::wltrace::wltrace(
-                        "rebase.pending_head",
-                        cmd.worktree.as_deref().unwrap_or(Path::new("")),
-                        || {
-                            format!(
-                                "old_head={} rebase_start={} ref_changes={}",
-                                pending_old_head.as_deref().unwrap_or("NONE"),
-                                rebase_start
-                                    .as_ref()
-                                    .map(|(old, new)| format!("{old}->{new}"))
-                                    .unwrap_or_else(|| "NONE".to_string()),
-                                cmd.ref_changes.len(),
-                            )
-                        },
-                    );
-                    if let Some(old_head) = pending_old_head {
-                        let rebase_onto = rebase_start.as_ref().map(|(_, new)| new.clone());
-                        if std::env::var("GIT_AI_DEBUG_DAEMON_TRACE")
-                            .ok()
-                            .as_deref()
-                            .is_some_and(|v| v == "1")
-                        {
-                            tracing::debug!(
-                                ?family,
-                                %old_head,
-                                ?rebase_onto,
-                                "pending rebase original head set"
-                            );
-                        }
-                        self.set_pending_rebase_original_head_for_worktree(
-                            worktree,
-                            old_head,
-                            rebase_onto,
-                        )?;
-                    }
-                }
-            }
-            if cmd.primary_command.as_deref() == Some("cherry-pick") {
-                let worktree = cmd.worktree.as_ref().ok_or_else(|| {
-                    GitAiError::Generic(format!(
-                        "cherry-pick side-effect state requires worktree sid={}",
-                        cmd.root_sid
-                    ))
-                })?;
-                if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
-                    self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
-                    self.clear_pending_cherry_pick_no_commit_for_worktree(worktree)?;
-                } else if !lite_mode && cmd.exit_code != 0 {
-                    let new_commits = cherry_pick_destination_commits(cmd);
-                    let is_continue = cherry_pick_command_has_flag(cmd, "--continue");
-                    let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
-                    let mut source_oids = cmd.cherry_pick_source_oids.clone();
-                    let mut source_oids_from_daemon_pending = false;
-                    if source_oids.is_empty()
-                        && (!new_commits.is_empty()
-                            || cherry_pick_state_exists_for_worktree(worktree))
-                    {
-                        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-                        source_oids =
-                            resolve_explicit_cherry_pick_sources_for_side_effect(&repo, cmd)?;
-                    }
-                    if source_oids.is_empty() && (is_continue || is_skip) {
-                        source_oids = self.pending_cherry_pick_sources_for_worktree(worktree)?;
-                        source_oids_from_daemon_pending = !source_oids.is_empty();
-                    }
-                    let skipped_sources = usize::from(is_skip && source_oids_from_daemon_pending);
-                    let applied_source_oids = source_oids
-                        .iter()
-                        .skip(skipped_sources)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !new_commits.is_empty() && !applied_source_oids.is_empty() {
-                        let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-                        let original_head = cherry_pick_original_head(cmd).ok_or_else(|| {
-                            GitAiError::Generic(format!(
-                                "cherry-pick completed commits without original HEAD sid={}",
-                                cmd.root_sid
-                            ))
-                        })?;
-                        apply_cherry_pick_complete_rewrite(
-                            &repo,
-                            &original_head,
-                            &applied_source_oids,
-                            &new_commits,
-                        )?;
-                    }
-                    if !source_oids.is_empty() || is_continue || is_skip {
-                        let applied_sources = new_commits
-                            .len()
-                            .min(source_oids.len().saturating_sub(skipped_sources));
-                        let consumed_sources = skipped_sources + applied_sources;
-                        let remaining = source_oids
-                            .iter()
-                            .skip(consumed_sources.min(source_oids.len()))
-                            .cloned()
-                            .collect();
-                        self.set_pending_cherry_pick_sources_for_worktree(worktree, remaining)?;
-                    }
-                }
-            }
-            // Fix #957: `checkout/switch --merge` exits with code 1 when it produces
-            // conflict markers but HEAD still moves to the target branch.  We must not
-            // return early here — fall through so apply_checkout_switch_working_log_side_effect
-            // and recent_checkout_switch_prerequisite_from_command can migrate the working log.
-            let is_merge_checkout =
-                matches!(cmd.primary_command.as_deref(), Some("checkout" | "switch")) && {
-                    let p = parsed_invocation_for_normalized_command(cmd);
-                    p.has_command_flag("--merge") || p.has_command_flag("-m")
-                };
-            // For stash pop/apply/branch with non-zero exit (typically conflict), don't
-            // skip processing. The stash may have been partially applied and attribution
-            // should still be restored. We cannot rely on `has_stash_conflict_for_repo`
-            // because in daemon mode the conflict check runs lazily at sync time -- by
-            // which point the user may already have resolved the conflict with `git add`.
-            // Instead, always attempt restoration for stash restore operations; if the
-            // stash was never applied the restore is a harmless no-op.
-            let is_stash_restore = cmd.primary_command.as_deref() == Some("stash")
-                && events.iter().any(|event| {
-                    matches!(
-                        event,
-                        crate::daemon::domain::SemanticEvent::StashOperation {
-                            kind: crate::daemon::domain::StashOpKind::Pop
-                                | crate::daemon::domain::StashOpKind::Apply
-                                | crate::daemon::domain::StashOpKind::Branch,
-                            ..
-                        }
-                    )
-                });
-            let is_merge_squash = cmd.primary_command.as_deref() == Some("merge")
-                && events.iter().any(|event| {
-                    matches!(
-                        event,
-                        crate::daemon::domain::SemanticEvent::MergeSquash { .. }
-                    )
-                });
-            if !is_merge_checkout && !is_stash_restore && !is_merge_squash {
-                return Ok(());
-            }
-            if is_stash_restore {
-                tracing::debug!(
-                    sid = %cmd.root_sid,
-                    "stash restore with non-zero exit, continuing to restore attribution"
-                );
-            }
-        }
-
-        if let Some(worktree) = cmd.worktree.as_ref() {
-            let worktree = worktree.to_string_lossy().to_string();
-            let mut handled_revert_commits = false;
-            for event in events {
-                match event {
-                    crate::daemon::domain::SemanticEvent::CloneCompleted { .. } => {
-                        apply_clone_notes_sync_side_effect(&worktree)?;
-                    }
-                    crate::daemon::domain::SemanticEvent::PullCompleted { .. } => {
-                        apply_pull_notes_sync_side_effect(
-                            &worktree,
-                            cmd.invoked_command.as_deref(),
-                            &cmd.invoked_args,
-                        )?;
-                    }
-                    crate::daemon::domain::SemanticEvent::PushCompleted { .. } => {
-                        apply_push_side_effect(
-                            &worktree,
-                            cmd.invoked_command.as_deref(),
-                            &cmd.invoked_args,
-                        )?;
-                    }
-                    crate::daemon::domain::SemanticEvent::CherryPickComplete {
-                        original_head,
-                        new_head,
-                        source_commits,
-                        new_commits,
-                    } => {
-                        if lite_mode {
-                            if !original_head.is_empty()
-                                && !new_head.is_empty()
-                                && original_head != new_head
-                            {
-                                let repo = find_repository_in_path(&worktree)?;
-                                repo.storage.rename_working_log(original_head, new_head)?;
-                            }
-                            self.clear_pending_cherry_pick_sources_for_worktree(worktree.as_ref())?;
-                        } else if !new_head.is_empty() {
-                            let repo = find_repository_in_path(&worktree)?;
-                            let mut sources = source_commits.clone();
-                            let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
-                            let explicit_source_args = cherry_pick_source_args_for_side_effect(cmd);
-                            if !sources.is_empty() {
-                                self.clear_pending_cherry_pick_sources_for_worktree(
-                                    worktree.as_ref(),
-                                )?;
-                            } else if !explicit_source_args.is_empty() {
-                                let head_context =
-                                    (!original_head.is_empty()).then_some(original_head.as_str());
-                                sources = resolve_cherry_pick_source_args_with_git_in_head_context(
-                                    &repo,
-                                    &explicit_source_args,
-                                    head_context,
-                                )?;
-                                self.clear_pending_cherry_pick_sources_for_worktree(
-                                    worktree.as_ref(),
-                                )?;
-                            } else {
-                                sources = self.take_pending_cherry_pick_sources_for_worktree(
-                                    worktree.as_ref(),
-                                )?;
-                                if is_skip && !sources.is_empty() {
-                                    sources.remove(0);
-                                }
-                            }
-                            let destinations = if new_commits.is_empty() {
-                                vec![new_head.clone()]
-                            } else {
-                                new_commits.clone()
-                            };
-                            if original_head != new_head {
-                                if original_head.is_empty() {
-                                    return Err(GitAiError::Generic(format!(
-                                        "cherry-pick complete missing original HEAD sid={}",
-                                        cmd.root_sid
-                                    )));
-                                }
-                                apply_cherry_pick_complete_rewrite(
-                                    &repo,
-                                    original_head,
-                                    &sources,
-                                    &destinations,
-                                )?;
-                            }
-                        }
-                    }
-                    crate::daemon::domain::SemanticEvent::CherryPickNoCommit {
-                        source_commits,
-                        head,
-                    } => {
-                        if !lite_mode {
-                            let mut sources = source_commits.clone();
-                            if sources.is_empty() {
-                                let repo = find_repository_in_path(&worktree)?;
-                                sources = resolve_explicit_cherry_pick_sources_for_side_effect(
-                                    &repo, cmd,
-                                )?;
-                            }
-                            if !head.is_empty() && !sources.is_empty() {
-                                self.set_pending_cherry_pick_no_commit_for_worktree(
-                                    worktree.as_ref(),
-                                    sources,
-                                    head.clone(),
-                                )?;
-                            }
-                        }
-                    }
-                    crate::daemon::domain::SemanticEvent::MergeSquash { source_head, onto } => {
-                        self.set_pending_squash_merge_for_worktree(
-                            worktree.as_ref(),
-                            source_head.clone(),
-                            onto.clone(),
-                        )?;
-                    }
-                    crate::daemon::domain::SemanticEvent::StashOperation { kind, head } => {
-                        let repo = find_repository_in_path(&worktree)?;
-                        match kind {
-                            crate::daemon::domain::StashOpKind::Push
-                            | crate::daemon::domain::StashOpKind::Unknown => {
-                                let resolved_stash =
-                                    cmd.stash_target_oid.as_deref().or_else(|| {
-                                        cmd.ref_changes
-                                        .iter()
-                                        .find(|rc| rc.reference == "refs/stash")
-                                        .map(|rc| rc.new.as_str())
-                                        .filter(|s| {
-                                            !s.is_empty()
-                                                && *s != "0000000000000000000000000000000000000000"
-                                        })
-                                    });
-                                if let Some(stash_sha) = resolved_stash {
-                                    let push_head =
-                                        stash_base_head(&repo, stash_sha).or_else(|| head.clone());
-                                    if let Some(head_sha) = push_head.as_deref() {
-                                        let pathspecs = Self::stash_pathspecs_from_command(cmd);
-                                        crate::authorship::rewrite_stash::handle_stash_create(
-                                            &repo, stash_sha, head_sha, pathspecs,
-                                        )?;
-                                    }
-                                }
-                            }
-                            crate::daemon::domain::StashOpKind::Pop => {
-                                if let Some(stash_sha) = resolve_stash_sha(cmd) {
-                                    let base_head = stash_base_head(&repo, stash_sha);
-                                    let target_head = head.as_deref().or(base_head.as_deref());
-                                    crate::authorship::rewrite_stash::handle_stash_pop_or_apply_with_head(
-                                        &repo, stash_sha, true, target_head,
-                                    )?;
-                                }
-                            }
-                            crate::daemon::domain::StashOpKind::Apply
-                            | crate::daemon::domain::StashOpKind::Branch => {
-                                if let Some(stash_sha) = resolve_stash_sha(cmd) {
-                                    let effective_head = if matches!(
-                                        kind,
-                                        crate::daemon::domain::StashOpKind::Branch
-                                    ) {
-                                        stash_base_head(&repo, stash_sha)
-                                    } else {
-                                        None
-                                    };
-                                    let base_head = stash_base_head(&repo, stash_sha);
-                                    let target_head = effective_head
-                                        .as_deref()
-                                        .or(head.as_deref())
-                                        .or(base_head.as_deref());
-                                    crate::authorship::rewrite_stash::handle_stash_pop_or_apply_with_head(
-                                        &repo, stash_sha, false, target_head,
-                                    )?;
-                                }
-                            }
-                            crate::daemon::domain::StashOpKind::Drop => {
-                                if let Some(stash_sha) = resolve_stash_sha(cmd) {
-                                    crate::authorship::rewrite_stash::handle_stash_drop(
-                                        &repo, stash_sha,
-                                    )?;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    crate::daemon::domain::SemanticEvent::CommitCreated { base, new_head } => {
-                        let mut handled_as_squash_merge = false;
-                        // DEFERRED (code-review #4): a pending `merge --squash` is
-                        // matched to the next commit by `base == pending.onto`
-                        // alone. If the user ABORTS the squash (e.g. `git reset
-                        // --hard` / `git checkout -- .`) and later makes an
-                        // unrelated commit on the same base, that commit is
-                        // mistaken for the squash and the source ref's session
-                        // metadata leaks into its note (inflating `git-ai stats`;
-                        // line-level blame stays correct). A robust fix is
-                        // non-trivial: the abandon commands (reset/checkout) are
-                        // not currently sequenced into this side-effect layer, so
-                        // we cannot clear the pending state on abort here, and a
-                        // metadata-prune alternative collides with the intentional
-                        // prompt-only-note feature. Left as-is pending one of
-                        // those two mechanisms.
-                        if !new_head.is_empty()
-                            && cmd.primary_command.as_deref() == Some("commit")
-                            && let Some(pending) =
-                                self.take_pending_squash_merge_for_worktree(worktree.as_ref())?
-                        {
-                            if base.as_deref().is_some_and(|base| base == pending.onto) {
-                                let repo = find_repository_in_path(&worktree)?;
-                                let outcome =
-                                    crate::authorship::rewrite::handle_rewrite_event_with_metrics(
-                                        &repo,
-                                        crate::authorship::rewrite::RewriteEvent::SquashMerge {
-                                            source_head: pending.source_head,
-                                            squash_commit: new_head.clone(),
-                                            onto: pending.onto,
-                                        },
-                                    )?;
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                                    &repo,
-                                    outcome.metric_commits,
-                                );
-                                handled_as_squash_merge = true;
-                            } else {
-                                self.set_pending_squash_merge_for_worktree(
-                                    worktree.as_ref(),
-                                    pending.source_head,
-                                    pending.onto,
-                                )?;
-                            }
-                        }
-
-                        if handled_as_squash_merge {
-                            // Squash authorship is reconstructed from the source ref captured
-                            // in sequenced trace/reflog state at `merge --squash` time.
-                        } else if is_completing_rebase || is_pull_rebase {
-                            // During rebase, note transfer is handled by non-FF detection.
-                            // Skip post-commit note generation to avoid overwriting shifted notes.
-                        } else if !new_head.is_empty()
-                            && cmd.primary_command.as_deref() == Some("revert")
-                        {
-                            if !handled_revert_commits {
-                                handled_revert_commits = true;
-                                if lite_mode {
-                                    if let Some(base) = base.as_deref()
-                                        && let Some(destination) =
-                                            revert_destination_changes(cmd).last()
-                                        && base != destination.new
-                                    {
-                                        let repo = find_repository_in_path(&worktree)?;
-                                        repo.storage.rename_working_log(base, &destination.new)?;
-                                    }
-                                    continue;
-                                }
-                                // A single `git revert A B` creates one commit per source.
-                                // Reconstruct each destination from the matching HEAD transition
-                                // instead of treating the command as one final CommitCreated event.
-                                let repo = find_repository_in_path(&worktree)?;
-                                let mut source_oids = cmd.revert_source_oids.clone();
-                                if source_oids.is_empty() {
-                                    source_oids = resolve_explicit_revert_sources_for_side_effect(
-                                        &repo, cmd,
-                                    )?;
-                                }
-                                apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
-                            }
-                        } else if !new_head.is_empty() {
-                            let repo = find_repository_in_path(&worktree)?;
-                            let author = repo.effective_author_identity().formatted_or_unknown();
-                            let base_opt = base.clone().filter(|b| !b.is_empty() && b != "initial");
-                            let commit_source = is_untraced_root_sid(&cmd.root_sid).then_some(
-                                crate::authorship::post_commit::UNTRACED_FIXUP_COMMIT_SOURCE,
-                            );
-                            crate::wltrace::wltrace(
-                                "commit.post_commit",
-                                Path::new(cmd.worktree.as_deref().unwrap_or(Path::new(""))),
-                                || {
-                                    format!(
-                                        "sid={} base={:?} new_head={}",
-                                        cmd.root_sid, base_opt, new_head
-                                    )
-                                },
-                            );
-                            let recovery_file_timestamps = Self::take_commit_file_timestamps(
-                                commit_file_timestamp_snapshots,
-                                new_head,
-                            )
-                            .await;
-                            let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
-                                self.wait_for_session_event_recovery_candidate(
-                                    &repo,
-                                    new_head,
-                                    recovery_file_timestamps.as_ref(),
-                                    unknown_by_file,
-                                );
-                            };
-
-                            // Post-commit note generation does synchronous git/filesystem work
-                            // and may briefly wait for transcript recovery. Mark it as blocking
-                            // so the transcript worker can process the recovery sweep promptly.
-                            run_blocking_side_effect(|| {
-                                crate::authorship::post_commit::post_commit_from_working_log_with_recovery_timestamps(
-                                    &repo,
-                                    base_opt.clone(),
-                                    new_head.clone(),
-                                    author,
-                                    crate::authorship::post_commit::PostCommitOptions::with_recovery(commit_source),
-                                    recovery_file_timestamps.as_ref(),
-                                    Some(&recovery_preflight),
-                                )
-                            })?;
-
-                            if !lite_mode
-                                && cmd.primary_command.as_deref() == Some("commit")
-                                && let Some(pending) = self
-                                    .take_pending_cherry_pick_no_commit_for_worktree(
-                                        worktree.as_ref(),
-                                    )?
-                            {
-                                if base.as_deref().is_some_and(|base| base == pending.head) {
-                                    apply_cherry_pick_no_commit_rewrite(
-                                        &repo,
-                                        &pending.source_commits,
-                                        &pending.head,
-                                        new_head,
-                                    )?;
-                                } else {
-                                    self.set_pending_cherry_pick_no_commit_for_worktree(
-                                        worktree.as_ref(),
-                                        pending.source_commits,
-                                        pending.head,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    crate::daemon::domain::SemanticEvent::CommitAmended { old_head, new_head } => {
-                        if !old_head.is_empty()
-                            && !new_head.is_empty()
-                            && old_head != new_head
-                            && is_valid_oid(old_head)
-                            && !is_zero_oid(old_head)
-                            && is_valid_oid(new_head)
-                            && !is_zero_oid(new_head)
-                        {
-                            let repo = find_repository_in_path(&worktree)?;
-                            if lite_mode {
-                                repo.storage.rename_working_log(old_head, new_head)?;
-                                continue;
-                            }
-                            let author = repo.effective_author_identity().formatted_or_unknown();
-                            let recovery_file_timestamps = Self::take_commit_file_timestamps(
-                                commit_file_timestamp_snapshots,
-                                new_head,
-                            )
-                            .await;
-                            let recovery_preflight = |unknown_by_file: &crate::authorship::attribution_recovery::UnknownLinesByFile| {
-                                self.wait_for_session_event_recovery_candidate(
-                                    &repo,
-                                    new_head,
-                                    recovery_file_timestamps.as_ref(),
-                                    unknown_by_file,
-                                );
-                            };
-                            // Post-commit note generation does synchronous git/filesystem work
-                            // and may briefly wait for transcript recovery. Mark it as blocking
-                            // so the transcript worker can process the recovery sweep promptly.
-                            let amend_result = run_blocking_side_effect(|| {
-                                crate::authorship::post_commit::post_commit_amend_with_recovery_timestamps_detailed(
-                                    &repo,
-                                    old_head,
-                                    new_head,
-                                    author,
-                                    recovery_file_timestamps.as_ref(),
-                                    Some(&recovery_preflight),
-                                )
-                            })?;
-                            if crate::authorship::rewrite::rewrite_metrics_enabled() {
-                                crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                                    &repo,
-                                    vec![
-                                        crate::authorship::rewrite::RewriteMetricCommit::new(
-                                            new_head.to_string(),
-                                            vec![old_head.to_string()],
-                                            crate::authorship::rewrite::RewriteMetricOperation::Amend,
-                                        )
-                                        .with_parent_sha(amend_result.parent_sha)
-                                        .with_authorship_note(amend_result.authorship_note),
-                                    ],
-                                );
-                            }
-                        }
-                    }
-                    crate::daemon::domain::SemanticEvent::Reset {
-                        kind,
-                        old_head,
-                        new_head,
-                    } if !old_head.is_empty() && !new_head.is_empty() && old_head != new_head => {
-                        let repo = find_repository_in_path(&worktree)?;
-                        match kind {
-                            crate::daemon::domain::ResetKind::Hard => {
-                                repo.storage.delete_working_log_for_base_commit(old_head)?;
-                            }
-                            _ => {
-                                if is_ancestor_commit(&repo, new_head, old_head) {
-                                    crate::authorship::rewrite_reset::reconstruct_working_log_after_backward_reset(
-                                        &repo, old_head, new_head,
-                                    )?;
-                                } else if is_ancestor_commit(&repo, old_head, new_head) {
-                                    // Forward reset (e.g. syncing onto a newer upstream
-                                    // commit): carry the working log to the new base,
-                                    // matching the pull fast-forward side effect.
-                                    repo.storage.rename_working_log(old_head, new_head)?;
-                                } else if !lite_mode {
-                                    let outcome =
-                                        crate::authorship::rewrite::handle_rewrite_event_with_metrics(
-                                        &repo,
-                                        crate::authorship::rewrite::RewriteEvent::NonFastForward {
-                                            old_tip: old_head.to_string(),
-                                            new_tip: new_head.to_string(),
-                                            onto: None,
-                                        },
-                                    )?;
-                                    crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
-                                        &repo,
-                                        outcome.metric_commits,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if matches!(cmd.primary_command.as_deref(), Some("checkout" | "switch")) {
-            if let Some(prerequisite) = recent_checkout_switch_prerequisite_from_command(cmd) {
-                let family = family.map(std::borrow::ToOwned::to_owned).or_else(|| {
-                    cmd.worktree.as_ref().and_then(|worktree| {
-                        find_repository_in_path(&worktree.to_string_lossy())
-                            .ok()
-                            .map(|repo| family_key_for_repository(&repo))
-                    })
-                });
-                if let Some(family) = family {
-                    self.record_recent_replay_prerequisite(&family, prerequisite)?;
-                }
-            }
-            apply_checkout_switch_working_log_side_effect(cmd)?;
-        }
-
-        if saw_pull_event && let Some(worktree) = cmd.worktree.as_ref() {
-            let (old_head, new_head) = Self::resolve_heads_for_command(cmd);
-            if !old_head.is_empty() && !new_head.is_empty() && old_head != new_head {
-                let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-                if repo_is_ancestor(&repo, &old_head, &new_head) {
-                    apply_pull_fast_forward_working_log_side_effect(
-                        &worktree.to_string_lossy(),
-                        &old_head,
-                        &new_head,
-                    )?;
-                }
-            }
-        }
-
-        // Handle update-ref: migrate working logs and authorship notes when the ref
-        // update affects the currently checked-out branch.
-        if primary == "update-ref"
-            && let Some(worktree) = cmd.worktree.as_ref()
-        {
-            for event in events {
-                if let crate::daemon::domain::SemanticEvent::RefUpdated {
-                    reference,
-                    old,
-                    new,
-                } = event
-                {
-                    if reference != "HEAD" && !reference.starts_with("refs/heads/")
-                        || !is_valid_oid(old)
-                        || is_zero_oid(old)
-                        || !is_valid_oid(new)
-                        || is_zero_oid(new)
-                        || old == new
-                    {
-                        continue;
-                    }
-                    if lite_mode {
-                        // The trace-derived pass above already moved the working log when this
-                        // transition also moved HEAD. Avoid the commit-graph lookup and note write.
-                        continue;
-                    }
-                    let repo = find_repository_in_path(&worktree.to_string_lossy())?;
-                    if repo_is_ancestor(&repo, old, new) {
-                        let affects_checked_out_branch = reference == "HEAD"
-                            || cmd.ref_changes.iter().any(|change| {
-                                change.reference == "HEAD"
-                                    && change.old == *old
-                                    && change.new == *new
-                            });
-                        if affects_checked_out_branch {
-                            if repo.storage.has_working_log(old) {
-                                let author =
-                                    repo.effective_author_identity().formatted_or_unknown();
-                                crate::authorship::post_commit::post_commit_from_working_log(
-                                    &repo,
-                                    Some(old.to_string()),
-                                    new.to_string(),
-                                    author,
-                                    true,
-                                )?;
-                            }
-                            repo.storage.rename_working_log(old, new)?;
-                        }
-                    } else {
-                        crate::authorship::rewrite::handle_rewrite_event(
-                            &repo,
-                            crate::authorship::rewrite::RewriteEvent::NonFastForward {
-                                old_tip: old.to_string(),
-                                new_tip: new.to_string(),
-                                onto: None,
-                            },
-                        )?;
-                    }
-                }
-            }
-        }
-
-        let parsed_invocation = parsed_invocation_for_normalized_command(cmd);
-        for trigger in transcript_sweep_triggers_for_events(events) {
-            if trigger == crate::daemon::stream_worker::SweepTrigger::PostPush
-                && crate::git::cli_parser::is_dry_run(&parsed_invocation.command_args)
+            if let Ok(path) = std::env::var("GIT_AI_TEST_PANIC_IN_SIDE_EFFECT_FLAG")
+                && Path::new(&path).exists()
             {
-                tracing::debug!("transcript sweep trigger skipped for dry-run push");
-                continue;
+                panic!("test-induced panic in side-effect pipeline");
             }
-            self.trigger_transcript_sweep(trigger);
         }
-
-        Ok(())
+        let Some(worktree) = &applied.command.worktree else {
+            return Ok(());
+        };
+        let command = applied.command.clone();
+        let events = applied.analysis.events.clone();
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-support")]
+            if let Ok(spec) = std::env::var("GIT_AI_TEST_DELAY_SIDE_EFFECT_MS_FOR_COMMAND") {
+                for entry in spec.split(',') {
+                    if let Some((primary, delay)) = entry.split_once('=')
+                        && command.primary_command.as_deref() == Some(primary)
+                        && let Ok(delay_ms) = delay.parse::<u64>()
+                    {
+                        tracing::info!(op = primary, delay_ms, "test side-effect delay started");
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                }
+            }
+            let repo = discover_repository_in_path_no_git_exec(&worktree)?;
+            crate::commit_links::rewrite::process_command(&repo, &command, &events)
+        })
+        .await
+        .map_err(|error| GitAiError::Generic(error.to_string()))?
     }
 
     /// Whether `payload` is the last frame the daemon will see for its root:
@@ -8224,7 +3982,6 @@ impl ActorDaemonCoordinator {
                 &command.raw_argv,
             )
         {
-            self.cache_commit_file_timestamp_snapshots_for_command(&command)?;
             let started_at_ns = command.started_at_ns;
             self.append_family_sequencer_entry(
                 &family,
@@ -8242,15 +3999,12 @@ impl ActorDaemonCoordinator {
         // unbounded git work: sequence it so drains execute it off-worker,
         // ordered by the command's start time and serialized with the
         // family's other passes (#2252).
-        let commit_file_timestamp_snapshots =
-            Self::start_commit_file_timestamp_snapshots_for_command(&applied.command);
         let started_at_ns = applied.command.started_at_ns;
         self.append_family_sequencer_entry(
             &family,
             started_at_ns,
             FamilySequencerEntry::AppliedSideEffects {
                 applied: Box::new(applied),
-                commit_file_timestamp_snapshots,
             },
         )?;
         Ok(Some(family))
@@ -8261,15 +4015,6 @@ impl ActorDaemonCoordinator {
             return Ok(());
         }
         self.apply_trace_payload_to_state(payload).await
-    }
-
-    async fn watermarks_for_family(
-        &self,
-        repo_working_dir: String,
-    ) -> Result<crate::daemon::domain::WatermarkState, GitAiError> {
-        self.coordinator
-            .watermarks_family(Path::new(&repo_working_dir))
-            .await
     }
 
     async fn status_for_family(
@@ -8342,17 +4087,7 @@ impl ActorDaemonCoordinator {
 
         loop {
             self.wait_for_no_unadmitted_checkpoints().await;
-            // Drain every family, not just the synced one: side-effect
-            // passes can write into other repositories (`git push <path>`
-            // pushes authorship notes into the destination repo), and before
-            // side effects ran detached the global ingest watermark implied
-            // all already-ingested passes had completed. Ready entries are
-            // executed here or by their detached drains (serialized per
-            // family by the exec lock); passes already handed off are
-            // visible via the effect registrations they take before the
-            // watermark advances (#2252). Entries fail-closed behind a
-            // still-open trace root stay queued without blocking this loop,
-            // exactly as they did pre-detachment.
+            // Drain ready work without bypassing an older trace root's fence.
             self.drain_all_ready_family_sequencers().await?;
             if self.unadmitted_checkpoints.load(Ordering::Acquire) == 0
                 && !self.has_inflight_family_effects()
@@ -8363,6 +4098,47 @@ impl ActorDaemonCoordinator {
         }
 
         self.status_for_family(repo_working_dir).await
+    }
+
+    /// Queries need prior admissions and this family's effects, not the
+    /// global completion barrier used by sync/await. Keep the execution lock
+    /// through the subsequent state read so a queued commit cannot consume
+    /// its pending window between draining and reading SQLite.
+    async fn sync_checkpoint_query(
+        self: &Arc<Self>,
+        repo_working_dir: &str,
+    ) -> Result<(String, tokio::sync::OwnedMutexGuard<()>), GitAiError> {
+        let checkpoint_target = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
+        self.wait_for_checkpoint_admission_through(checkpoint_target)
+            .await;
+        let family = self.backend.resolve_family(Path::new(repo_working_dir))?.0;
+        self.wait_for_trace_ingest_processed_through_family(&family)
+            .await;
+        loop {
+            if self.is_shutting_down() {
+                return Err(GitAiError::Generic("daemon is shutting down".into()));
+            }
+            // The sequencer's existing admission gate also covers requests
+            // received while the trace watermark was advancing.
+            self.wait_for_no_unadmitted_checkpoints().await;
+            let guard = self.side_effect_exec_lock(&family)?.lock_owned().await;
+            let fenced = self
+                .drain_ready_family_sequencer_entries_locked(&family)
+                .await?;
+            if self.unadmitted_checkpoints.load(Ordering::Acquire) > 0
+                || matches!(
+                    self.family_front_entry_disposition(&family),
+                    FamilyFrontDisposition::Ready
+                )
+            {
+                drop(guard);
+                continue;
+            }
+            if fenced.is_some() {
+                self.schedule_family_drain(family.clone());
+            }
+            return Ok((family, guard));
+        }
     }
 
     async fn drain_accepted_checkpoints(self: &Arc<Self>) -> Result<(), GitAiError> {
@@ -8398,167 +4174,128 @@ impl ActorDaemonCoordinator {
         let log_interval = Duration::from_secs(3);
         let mut last_log = start;
 
-        let mut result = AwaitResult {
-            done: false,
-            timed_out: false,
-            metrics_remaining: 0,
-            notes_remaining: 0,
-            otel_remaining: 0,
-            otel_failed: 0,
-        };
+        loop {
+            let mut result = AwaitResult {
+                done: false,
+                timed_out: false,
+                otel_remaining: 0,
+                otel_failed: 0,
+            };
 
-        let mut maybe_log = |phase: &str| {
-            let now = Instant::now();
-            if now - last_log >= log_interval {
-                tracing::info!(phase, "await: still waiting");
-                eprintln!("await: still waiting for {}...", phase);
-                last_log = now;
-            }
-        };
+            let mut maybe_log = |phase: &str| {
+                let now = Instant::now();
+                if now - last_log >= log_interval {
+                    tracing::info!(phase, "await: still waiting");
+                    eprintln!("await: still waiting for {}...", phase);
+                    last_log = now;
+                }
+            };
 
-        // Phase 1: wait for the trace-ingest and family-sequencer work side.
-        while !self.is_shutting_down() {
-            let now = Instant::now();
-            if now >= deadline {
-                result.timed_out = true;
-                break;
-            }
-            let remaining = deadline - now;
+            // Phase 1: wait for the trace-ingest and family-sequencer work side.
+            while !self.is_shutting_down() {
+                let now = Instant::now();
+                if now >= deadline {
+                    result.timed_out = true;
+                    break;
+                }
+                let remaining = deadline - now;
 
-            maybe_log("daemon work");
-            if timeout(remaining, self.wait_for_trace_ingest_processed_through())
-                .await
-                .is_err()
-            {
-                result.timed_out = true;
-                break;
+                maybe_log("daemon work");
+                if timeout(remaining, self.wait_for_trace_ingest_processed_through())
+                    .await
+                    .is_err()
+                {
+                    result.timed_out = true;
+                    break;
+                }
+
+                if self.is_shutting_down() {
+                    break;
+                }
+
+                let now = Instant::now();
+                if now >= deadline {
+                    result.timed_out = true;
+                    break;
+                }
+                let remaining = deadline - now;
+
+                if timeout(remaining, self.drain_all_ready_family_sequencers())
+                    .await
+                    .is_err()
+                {
+                    result.timed_out = true;
+                    break;
+                }
+
+                if !self.has_pending_daemon_work() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
             if self.is_shutting_down() {
-                break;
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
                 result.timed_out = true;
-                break;
             }
-            let remaining = deadline - now;
 
-            if timeout(remaining, self.drain_all_ready_family_sequencers())
-                .await
-                .is_err()
+            // Phase 3: flush both independent telemetry workers.
+            let mut telemetry_flush_failed = false;
+            if !result.timed_out
+                && let Some(worker) = &self.telemetry_worker
             {
-                result.timed_out = true;
-                break;
-            }
-
-            if !self.has_pending_daemon_work() {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        if self.is_shutting_down() {
-            result.timed_out = true;
-        }
-
-        // Phase 2: drain the transcript/stream worker.
-        if !result.timed_out
-            && let Some(worker) = &self.stream_worker
-        {
-            let now = Instant::now();
-            if now < deadline {
-                let remaining = deadline - now;
-                maybe_log("transcript processing");
-                match timeout(remaining, worker.drain()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "await: transcript drain failed");
-                    }
-                    Err(_) => {
-                        result.timed_out = true;
-                    }
-                }
-            } else {
-                result.timed_out = true;
-            }
-        }
-
-        // Phase 2b: drain the token-usage worker. It is fed by stream-worker
-        // completions, so this must run after the transcript drain above.
-        if !result.timed_out
-            && let Some(worker) = &self.token_usage_worker
-        {
-            let now = Instant::now();
-            if now < deadline {
-                let remaining = deadline - now;
-                maybe_log("token-usage processing");
-                match timeout(remaining, worker.drain()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "await: token-usage drain failed");
-                    }
-                    Err(_) => {
-                        result.timed_out = true;
-                    }
-                }
-            } else {
-                result.timed_out = true;
-            }
-        }
-
-        // Phase 3: flush both independent telemetry workers.
-        let mut telemetry_flush_failed = false;
-        if !result.timed_out
-            && let Some(worker) = &self.telemetry_worker
-        {
-            let now = Instant::now();
-            if now < deadline {
-                let remaining = deadline - now;
-                maybe_log("telemetry flush");
-                let flushes =
-                    async { tokio::join!(worker.flush_and_wait(), crate::otel::flush_and_wait()) };
-                match timeout(remaining, flushes).await {
-                    Ok((regular, otel)) => {
-                        match regular {
-                            Ok(status) => {
-                                result.metrics_remaining = status.metrics_remaining;
-                                result.notes_remaining = status.notes_remaining;
+                let now = Instant::now();
+                if now < deadline {
+                    let remaining = deadline - now;
+                    maybe_log("telemetry flush");
+                    let flushes = async {
+                        tokio::join!(worker.flush_and_wait(), crate::otel::flush_and_wait())
+                    };
+                    match timeout(remaining, flushes).await {
+                        Ok((regular, otel)) => {
+                            match regular {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "await: telemetry flush failed");
+                                    telemetry_flush_failed = true;
+                                }
                             }
-                            Err(error) => {
-                                tracing::warn!(%error, "await: telemetry flush failed");
-                                telemetry_flush_failed = true;
+                            match otel {
+                                Ok(status) => {
+                                    result.otel_remaining = status.remaining;
+                                    result.otel_failed = status.failed;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "await: OTLP flush failed");
+                                    telemetry_flush_failed = true;
+                                }
                             }
                         }
-                        match otel {
-                            Ok(status) => {
-                                result.otel_remaining = status.remaining;
-                                result.otel_failed = status.failed;
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "await: OTLP flush failed");
-                                telemetry_flush_failed = true;
-                            }
+                        Err(_) => {
+                            result.timed_out = true;
                         }
                     }
-                    Err(_) => {
-                        result.timed_out = true;
-                    }
+                } else {
+                    result.timed_out = true;
                 }
-            } else {
-                result.timed_out = true;
             }
-        }
 
-        result.done = !result.timed_out
-            && !telemetry_flush_failed
-            && result.metrics_remaining == 0
-            && result.notes_remaining == 0
-            && result.otel_remaining == 0
-            && !self.has_pending_daemon_work();
-        result
+            result.done = !result.timed_out
+                && !telemetry_flush_failed
+                && result.otel_remaining == 0
+                && !self.has_pending_daemon_work();
+            if result.done
+                || result.timed_out
+                || telemetry_flush_failed
+                || result.otel_remaining > 0
+                || !self.has_pending_daemon_work()
+            {
+                return result;
+            }
+            // New sequenced work can arrive while the delivery workers flush.
+            // Drain it within the original deadline rather than reporting an
+            // unfinished await with no queued OTEL work.
+        }
     }
 
     fn has_pending_daemon_work(&self) -> bool {
@@ -8616,6 +4353,51 @@ impl ActorDaemonCoordinator {
             ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
                 "checkpoint.run requires the framed checkpoint transport".to_string(),
             )),
+            ControlRequest::CheckpointAttachment {
+                repo_working_dir,
+                session,
+            } => {
+                async {
+                    let (family, _family_guard) =
+                        self.sync_checkpoint_query(&repo_working_dir).await?;
+                    let uncertain = self.family_has_open_mutating_root(&family)?;
+                    let runtime = Arc::clone(&self.link_checkpoints);
+                    let mut state = tokio::task::spawn_blocking(move || {
+                        runtime.attachment(Path::new(&repo_working_dir), &session)
+                    })
+                    .await
+                    .map_err(|error| GitAiError::Generic(error.to_string()))??;
+                    if uncertain || self.family_has_open_mutating_root(&family)? {
+                        state.attached = false;
+                    }
+                    Ok(ControlResponse::ok(
+                        None,
+                        Some(serde_json::to_value(state)?),
+                    ))
+                }
+                .await
+            }
+            ControlRequest::CheckpointInvocation {
+                repo_working_dir,
+                session,
+                invocation_id,
+            } => {
+                async {
+                    let (_family, _family_guard) =
+                        self.sync_checkpoint_query(&repo_working_dir).await?;
+                    let runtime = Arc::clone(&self.link_checkpoints);
+                    let invocation = tokio::task::spawn_blocking(move || {
+                        runtime.invocation(Path::new(&repo_working_dir), &session, &invocation_id)
+                    })
+                    .await
+                    .map_err(|error| GitAiError::Generic(error.to_string()))??;
+                    Ok(ControlResponse::ok(
+                        None,
+                        Some(serde_json::to_value(invocation)?),
+                    ))
+                }
+                .await
+            }
             ControlRequest::SyncFamily { repo_working_dir } => {
                 self.sync_family(repo_working_dir).await.and_then(|status| {
                     serde_json::to_value(status)
@@ -8631,307 +4413,20 @@ impl ActorDaemonCoordinator {
                         .map(|v| ControlResponse::ok(None, Some(v)))
                         .map_err(GitAiError::from)
                 }),
-            ControlRequest::SnapshotWatermarks { repo_working_dir } => self
-                .watermarks_for_family(repo_working_dir.clone())
-                .await
-                .and_then(|ws| {
-                    let worktree_key = Self::worktree_state_key(Path::new(&repo_working_dir));
-                    let worktree_wm = ws.per_worktree.get(&worktree_key).copied();
-                    serde_json::to_value(json!({
-                        "watermarks": ws.per_file,
-                        "worktree_watermark": worktree_wm,
-                    }))
-                    .map(|v| ControlResponse::ok(None, Some(v)))
-                    .map_err(GitAiError::from)
-                }),
             ControlRequest::SubmitTelemetry { envelopes } => {
                 if let Some(worker) = &self.telemetry_worker {
                     worker.submit_telemetry(envelopes).await;
                 }
                 Ok(ControlResponse::ok(None, None))
             }
-            ControlRequest::SubmitCas { records } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.submit_cas(records).await;
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::FlushNotes => {
-                // Fire-and-forget trigger routed through the serialized flush
-                // loop (the periodic loop is the safety net); see
-                // `request_flush` for why a bare concurrent `flush_notes`
-                // here would let `await` certify mid-upload.
-                if let Some(worker) = &self.telemetry_worker {
-                    worker.request_flush();
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::ReingestMetrics { from_ts, to_ts } => {
-                if let Some(worker) = &self.telemetry_worker {
-                    worker
-                        .reingest_metrics(from_ts, to_ts)
-                        .await
-                        .and_then(|reset| {
-                            serde_json::to_value(json!({ "reset": reset }))
-                                .map(|value| ControlResponse::ok(None, Some(value)))
-                                .map_err(GitAiError::from)
-                        })
-                } else {
-                    Err(GitAiError::Generic(
-                        "telemetry worker is not available".to_string(),
-                    ))
-                }
-            }
             ControlRequest::StatsIngest => serde_json::to_value(IngestLossSnapshot::capture(self))
                 .map(|v| ControlResponse::ok(None, Some(v)))
                 .map_err(GitAiError::from),
-            ControlRequest::UntracedFixupScan { repo_working_dir } => self
-                .schedule_untraced_commit_scans(repo_working_dir, UntracedScanTrigger::Request)
-                .await
-                .and_then(|scheduled| {
-                    serde_json::to_value(scheduled)
-                        .map(|v| ControlResponse::ok(None, Some(v)))
-                        .map_err(GitAiError::from)
-                }),
             ControlRequest::Await { timeout_secs } => {
                 let result = self.await_completion(timeout_secs).await;
                 serde_json::to_value(result)
                     .map(|v| ControlResponse::ok(None, Some(v)))
                     .map_err(GitAiError::from)
-            }
-            ControlRequest::BashSessionStart {
-                repo_work_dir,
-                original_cwd,
-                session_id,
-                tool_use_id,
-                agent_id,
-                metadata,
-                stat_snapshot,
-                trace_id,
-                started_at_ns,
-                command,
-            } => {
-                let worktree_key = Self::worktree_state_key(Path::new(&repo_work_dir));
-                let original_cwd = original_cwd.unwrap_or_else(|| repo_work_dir.clone());
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: Some(worktree_key.clone()),
-                            repo_discovery_error: None,
-                            session_id: session_id.clone(),
-                            tool_use_id: tool_use_id.clone(),
-                            agent_id: agent_id.clone(),
-                            start_trace_id: trace_id.clone(),
-                            started_at_ns,
-                            command: command.clone(),
-                            metadata: metadata.clone(),
-                        })
-                {
-                    tracing::debug!("failed to persist bash session start: {}", e);
-                }
-
-                let mut state = self.bash_sessions.lock().unwrap();
-                state.start_session(crate::daemon::bash_sessions::BashSessionStart {
-                    session_id,
-                    tool_use_id,
-                    repo_work_dir: worktree_key,
-                    agent_id,
-                    metadata,
-                    stat_snapshot: *stat_snapshot,
-                    start_trace_id: trace_id,
-                    started_at_ns,
-                    command,
-                });
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::BashSessionEnd {
-                repo_work_dir,
-                original_cwd,
-                session_id,
-                tool_use_id,
-                agent_id,
-                metadata,
-                trace_id,
-                ended_at_ns,
-                command,
-            } => {
-                let mut state = self.bash_sessions.lock().unwrap();
-                let session = state.end_session(&session_id, &tool_use_id);
-                drop(state);
-
-                let worktree_key = session
-                    .as_ref()
-                    .map(|s| s.repo_work_dir.clone())
-                    .unwrap_or_else(|| Self::worktree_state_key(Path::new(&repo_work_dir)));
-                let original_cwd = original_cwd
-                    .map(|cwd| Self::worktree_state_key(Path::new(&cwd)))
-                    .unwrap_or_else(|| worktree_key.clone());
-                let start_trace_id = session.as_ref().map(|s| s.start_trace_id.clone());
-                let started_at_ns = session.as_ref().map(|s| s.started_at_ns);
-                let command = command.or_else(|| session.as_ref().and_then(|s| s.command.clone()));
-                let agent_id = session
-                    .as_ref()
-                    .map(|s| s.agent_id.clone())
-                    .unwrap_or(agent_id);
-                let metadata = if metadata.is_empty() {
-                    session
-                        .as_ref()
-                        .map(|s| s.metadata.clone())
-                        .unwrap_or_default()
-                } else {
-                    metadata
-                };
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
-                            original_cwd,
-                            repo_work_dir: Some(worktree_key),
-                            repo_discovery_error: None,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id,
-                            end_trace_id: trace_id,
-                            started_at_ns,
-                            ended_at_ns,
-                            command,
-                            metadata,
-                        })
-                {
-                    tracing::debug!("failed to persist bash session end: {}", e);
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::BashHookAttemptStart {
-                original_cwd,
-                discovered_repo_work_dir,
-                repo_discovery_error,
-                session_id,
-                tool_use_id,
-                agent_id,
-                metadata,
-                trace_id,
-                started_at_ns,
-                command,
-            } => {
-                let discovered_repo_work_dir = discovered_repo_work_dir
-                    .as_deref()
-                    .map(Path::new)
-                    .map(Self::worktree_state_key);
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_start(&crate::daemon::bash_history_db::BashCallStart {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: discovered_repo_work_dir,
-                            repo_discovery_error,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id: trace_id,
-                            started_at_ns,
-                            command,
-                            metadata,
-                        })
-                {
-                    tracing::debug!("failed to persist bash hook attempt start: {}", e);
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::BashHookAttemptEnd {
-                original_cwd,
-                discovered_repo_work_dir,
-                repo_discovery_error,
-                session_id,
-                tool_use_id,
-                agent_id,
-                metadata,
-                trace_id,
-                ended_at_ns,
-                command,
-            } => {
-                let discovered_repo_work_dir = discovered_repo_work_dir
-                    .as_deref()
-                    .map(Path::new)
-                    .map(Self::worktree_state_key);
-                if let Ok(db) = crate::daemon::bash_history_db::BashHistoryDatabase::global()
-                    && let Ok(mut db_lock) = db.lock()
-                    && let Err(e) =
-                        db_lock.record_end(&crate::daemon::bash_history_db::BashCallEnd {
-                            original_cwd: Self::worktree_state_key(Path::new(&original_cwd)),
-                            repo_work_dir: discovered_repo_work_dir,
-                            repo_discovery_error,
-                            session_id,
-                            tool_use_id,
-                            agent_id,
-                            start_trace_id: None,
-                            end_trace_id: trace_id,
-                            started_at_ns: None,
-                            ended_at_ns,
-                            command,
-                            metadata,
-                        })
-                {
-                    tracing::debug!("failed to persist bash hook attempt end: {}", e);
-                }
-                Ok(ControlResponse::ok(None, None))
-            }
-            ControlRequest::BashSessionQuery { repo_work_dir } => {
-                let state = self.bash_sessions.lock().unwrap();
-                let repo_work_dir = Self::worktree_state_key(Path::new(&repo_work_dir));
-                let response = match state.query_active_for_repo(&repo_work_dir) {
-                    Some((key, session)) => {
-                        let data = serde_json::to_value(BashSessionQueryResponse {
-                            active: true,
-                            agent_id: Some(session.agent_id.clone()),
-                            session_id: Some(key.0.clone()),
-                            tool_use_id: Some(key.1.clone()),
-                            metadata: Some(session.metadata.clone()),
-                        })
-                        .ok();
-                        ControlResponse::ok(None, data)
-                    }
-                    None => {
-                        let data = serde_json::to_value(BashSessionQueryResponse {
-                            active: false,
-                            agent_id: None,
-                            session_id: None,
-                            tool_use_id: None,
-                            metadata: None,
-                        })
-                        .ok();
-                        ControlResponse::ok(None, data)
-                    }
-                };
-                Ok(response)
-            }
-            ControlRequest::BashSnapshotQuery {
-                session_id,
-                tool_use_id,
-            } => {
-                let state = self.bash_sessions.lock().unwrap();
-                let response = match state.get_snapshot(&session_id, &tool_use_id) {
-                    Some(snapshot) => {
-                        let data = serde_json::to_value(BashSnapshotQueryResponse {
-                            found: true,
-                            stat_snapshot: Some(snapshot.clone()),
-                        })
-                        .ok();
-                        ControlResponse::ok(None, data)
-                    }
-                    None => {
-                        let data = serde_json::to_value(BashSnapshotQueryResponse {
-                            found: false,
-                            stat_snapshot: None,
-                        })
-                        .ok();
-                        ControlResponse::ok(None, data)
-                    }
-                };
-                Ok(response)
             }
             ControlRequest::Shutdown => match self.set_checkpoint_acceptance(false) {
                 Err(error) => Err(error),
@@ -10104,65 +5599,6 @@ fn family_causal_grace() -> Duration {
     env_duration_ms("GIT_AI_DAEMON_CAUSAL_GRACE_MS", FAMILY_CAUSAL_GRACE)
 }
 
-/// Reflog records younger than this are left for a later untraced-commit
-/// fixup pass: the trace2 frames of the command that wrote them may still be
-/// on their way to the daemon.
-const UNTRACED_FIXUP_MIN_AGE: Duration = Duration::from_secs(5);
-
-/// Commits one untraced-commit fixup pass attributes before yielding the
-/// family; the rest wait for the next pass.
-const UNTRACED_FIXUP_MAX_COMMITS_PER_PASS: usize = 10;
-
-/// Worktrees one periodic tick schedules passes for; more change than this
-/// only during a burst, and the rest follow next tick.
-const UNTRACED_FIXUP_MAX_SCANS_PER_TICK: usize = 32;
-
-/// Families one periodic tick examines (a directory listing and a `stat` per
-/// worktree each); with more, ticks rotate through them.
-const UNTRACED_FIXUP_MAX_FAMILIES_PER_TICK: usize = 256;
-
-/// How often a tick prunes the repo-family store and re-probes families whose
-/// common dir was missing (retention is measured in days, so hourly is plenty).
-const UNTRACED_STORE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-fn untraced_fixup_interval() -> Duration {
-    env_duration_ms(
-        "GIT_AI_DAEMON_UNTRACED_FIXUP_INTERVAL_MS",
-        crate::daemon::untraced_commit_fixup::DEFAULT_INTERVAL,
-    )
-}
-
-fn untraced_fixup_min_age() -> Duration {
-    // Zero is meaningful here (tests claim records at once), unlike the
-    // positive-only overrides `env_duration_ms` accepts.
-    std::env::var("GIT_AI_DAEMON_UNTRACED_FIXUP_MIN_AGE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(UNTRACED_FIXUP_MIN_AGE)
-}
-
-/// Current length of a worktree's `HEAD` reflog (`None` when it has none):
-/// the upper bound a fixup pass scheduled now may claim up to.
-fn head_reflog_len(git_dir: &Path) -> Option<u64> {
-    fs::metadata(git_dir.join("logs").join("HEAD"))
-        .ok()
-        .map(|metadata| metadata.len())
-}
-
-fn commit_created_new_head(applied: &crate::daemon::domain::AppliedCommand) -> Option<&str> {
-    applied
-        .analysis
-        .events
-        .iter()
-        .find_map(|event| match event {
-            crate::daemon::domain::SemanticEvent::CommitCreated { new_head, .. } => {
-                Some(new_head.as_str())
-            }
-            _ => None,
-        })
-}
-
 fn daemon_socket_health_check_interval() -> u64 {
     std::env::var("GIT_AI_DAEMON_SOCKET_HEALTH_CHECK_SECS")
         .ok()
@@ -10477,7 +5913,6 @@ fn should_defer_restart_for_checkpoints(
 pub(crate) struct IngestLossSnapshot {
     trace_payloads_dropped_queue_full: u64,
     trace_connections_dropped: u64,
-    telemetry_metric_batches_dropped: u64,
     checkpoints_dropped: u64,
 }
 
@@ -10490,60 +5925,31 @@ impl IngestLossSnapshot {
             trace_connections_dropped: coordinator
                 .trace_connections_dropped
                 .load(Ordering::Relaxed),
-            telemetry_metric_batches_dropped:
-                crate::daemon::telemetry_worker::metric_batches_dropped(),
             checkpoints_dropped: coordinator.checkpoints_dropped.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Persist a DaemonIngestAnomaly metric with the loss deltas since the
-/// previous report, so silent attribution loss becomes visible in fleet
-/// telemetry. Called from the health loop, from graceful teardown (so a
-/// queue-full shutdown still reports its loss), and from the shutdown
-/// enforcer.
-///
-/// Unlike sibling emitters this stores straight to the metrics DB instead of
-/// going through `crate::metrics::record`: the persistence queue is exactly
-/// the lossy component whose drops are being reported, and the snapshot must
-/// only advance when the write was actually accepted (otherwise a dropped
-/// emission permanently unreports its window).
+/// Report ingest loss through the operational daemon log, independently of link delivery.
 fn report_ingest_losses(coordinator: &Arc<ActorDaemonCoordinator>) {
-    use crate::metrics::pos_encoded::PosEncoded as _;
-
-    // try_lock: the shutdown enforcer calls this right before a forced exit
-    // and must never block; a contended lock just means another reporter is
-    // already delivering the same deltas.
-    let mut last_reported = match coordinator.last_reported_ingest_losses.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return,
+    let Ok(mut previous) = coordinator.last_reported_ingest_losses.try_lock() else {
+        return;
     };
     let current = IngestLossSnapshot::capture(coordinator);
-    if current == *last_reported {
-        return;
-    }
-    let values = crate::metrics::events::DaemonIngestAnomalyValues::new(
-        current
-            .trace_payloads_dropped_queue_full
-            .saturating_sub(last_reported.trace_payloads_dropped_queue_full),
-        current
-            .trace_connections_dropped
-            .saturating_sub(last_reported.trace_connections_dropped),
-        current
-            .telemetry_metric_batches_dropped
-            .saturating_sub(last_reported.telemetry_metric_batches_dropped),
-        current
-            .checkpoints_dropped
-            .saturating_sub(last_reported.checkpoints_dropped),
-    );
-    let attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"));
-    let event = crate::metrics::MetricEvent::from_values(values, attrs.to_sparse());
-    match crate::daemon::telemetry_worker::persist_metrics_now(&[event]) {
-        Ok(()) => *last_reported = current,
-        Err(error) => {
-            tracing::warn!(%error, "failed persisting ingest-loss metric; will retry next report");
-        }
+    if current != *previous {
+        tracing::warn!(
+            trace_payloads_dropped = current
+                .trace_payloads_dropped_queue_full
+                .saturating_sub(previous.trace_payloads_dropped_queue_full),
+            trace_connections_dropped = current
+                .trace_connections_dropped
+                .saturating_sub(previous.trace_connections_dropped),
+            checkpoints_dropped = current
+                .checkpoints_dropped
+                .saturating_sub(previous.checkpoints_dropped),
+            "daemon ingestion lost work"
+        );
+        *previous = current;
     }
 }
 
@@ -10750,100 +6156,13 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     remove_socket_if_exists(&config.trace_socket_path)?;
     remove_socket_if_exists(&config.control_socket_path)?;
 
+    crate::commit_links::store::LinkStore::open()?.abandon_invocations()?;
     let mut coordinator_inner = ActorDaemonCoordinator::new();
 
     // Spawn the telemetry worker inside the daemon's tokio runtime.
     let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
     crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());
     coordinator_inner.telemetry_worker = Some(telemetry_handle.clone());
-
-    coordinator_inner.untraced_fixup_ignore = Mutex::new(
-        crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore::from_config(
-            config::Config::get(),
-        ),
-    );
-    let repo_family_store_path = config.internal_dir.join("repo-families-db");
-    match crate::daemon::repo_family_store::RepoFamilyStore::open(&repo_family_store_path) {
-        Ok(store) => coordinator_inner.repo_family_store = Some(Arc::new(store)),
-        Err(error) => tracing::error!(
-            %error,
-            path = %repo_family_store_path.display(),
-            "failed to open repo-families database; untraced commit fixup will not survive restarts"
-        ),
-    }
-
-    // With the token-usage flag off, previously collected data is deleted
-    // regardless of the streaming gate below (the spec's "no collected data
-    // is retained" holds even when transcript_streaming is also off).
-    let token_usage_db_path = config.internal_dir.join("token-usage-db");
-    let token_usage_enabled = config::Config::get()
-        .get_feature_flags()
-        .token_usage_metrics;
-    if !token_usage_enabled {
-        crate::token_usage::db::TokenUsageDatabase::remove_database_files(&token_usage_db_path);
-    }
-
-    // Spawn the transcript worker BEFORE wrapping coordinator in Arc
-    if config::Config::get()
-        .get_feature_flags()
-        .transcript_streaming
-    {
-        // Named "transcripts-db" for backwards compatibility with existing installations.
-        // TODO: rename to "streams-db" with a migration that moves the file.
-        let streams_db_path = config.internal_dir.join("transcripts-db");
-        match crate::streams::db::StreamsDatabase::open(&streams_db_path) {
-            Ok(streams_db) => {
-                let streams_db = std::sync::Arc::new(streams_db);
-                let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-                // Each worker needs its own shutdown Notify: request_shutdown
-                // uses notify_one, which wakes exactly one waiter.
-                let token_usage_shutdown_notify = Arc::new(tokio::sync::Notify::new());
-                // The token-usage worker is fed by stream-worker completions,
-                // so it lives inside the transcript_streaming gate, behind
-                // its own startup flag (like transcript_streaming itself).
-                // When the flag is off, nothing runs and no database is
-                // created (deletion of old data happens above, outside this
-                // gate).
-                let token_usage_handle = if token_usage_enabled {
-                    match crate::token_usage::db::TokenUsageDatabase::open(&token_usage_db_path) {
-                        Ok(token_db) => {
-                            Some(crate::daemon::token_usage_worker::spawn_token_usage_worker(
-                                streams_db.clone(),
-                                std::sync::Arc::new(token_db),
-                                telemetry_handle.clone(),
-                                token_usage_shutdown_notify.clone(),
-                            ))
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to open token-usage database, token-usage worker not started");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let transcript_handle = crate::daemon::stream_worker::spawn_stream_worker(
-                    streams_db.clone(),
-                    telemetry_handle.clone(),
-                    shutdown_notify.clone(),
-                    token_usage_handle.clone(),
-                );
-                coordinator_inner.streams_db = Some(streams_db);
-                coordinator_inner.stream_worker = Some(transcript_handle);
-                coordinator_inner.token_usage_worker = token_usage_handle;
-                let _ = coordinator_inner
-                    .transcript_shutdown_notify
-                    .set(shutdown_notify);
-                let _ = coordinator_inner
-                    .token_usage_shutdown_notify
-                    .set(token_usage_shutdown_notify);
-                tracing::info!("transcript worker spawned");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to open transcripts database, transcript worker not started");
-            }
-        }
-    }
 
     let coordinator = Arc::new(coordinator_inner);
     // Heartbeats carry the pipeline health snapshot. The provider holds a Weak
@@ -10860,20 +6179,6 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     }));
     coordinator.start_trace_ingest_worker()?;
     coordinator.start_checkpoint_ingress_worker()?;
-    if config::Config::get()
-        .get_feature_flags()
-        .untraced_commit_fixup
-    {
-        let untraced_fixup_shutdown_notify = Arc::new(tokio::sync::Notify::new());
-        let _ = coordinator
-            .untraced_fixup_shutdown_notify
-            .set(untraced_fixup_shutdown_notify.clone());
-        crate::daemon::untraced_commit_fixup::spawn_untraced_fixup_worker(
-            Arc::downgrade(&coordinator),
-            untraced_fixup_interval(),
-            untraced_fixup_shutdown_notify,
-        );
-    }
     if let Some(limit_mb) = config::Config::get().daemon_memory_limit_mb()
         && let Some(limit_bytes) = limit_mb.checked_mul(config::MEBIBYTE_BYTES)
     {
@@ -10956,13 +6261,6 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
 
     // Metric batches still sitting in the persistence queue must reach SQLite
     // before this process exits, or a restart silently loses them.
-    if let Some(worker) = &coordinator.telemetry_worker
-        && !worker
-            .drain_metrics_persist_queue(std::time::Duration::from_secs(2))
-            .await
-    {
-        tracing::warn!("telemetry metrics persist queue was not fully drained at shutdown");
-    }
 
     // Final loss report: a shutdown caused by a full ingest queue is the
     // severest attribution-loss event; persisting the deltas here lets the
@@ -11126,14 +6424,12 @@ fn checkpoint_control_response_timeout(
             DAEMON_CHECKPOINT_RESPONSE_TIMEOUT
         }
         ControlRequest::SyncFamily { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
-        ControlRequest::SnapshotWatermarks { .. } => Duration::from_millis(500),
         // Await blocks until the requested timeout is reached; give the daemon
         // a small grace period over the requested limit so the caller sees a
         // response rather than a client-side socket timeout.
         ControlRequest::Await { timeout_secs } => {
             Duration::from_secs(timeout_secs.saturating_add(5))
         }
-        ControlRequest::ReingestMetrics { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         ControlRequest::Shutdown => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     }
@@ -11474,6 +6770,61 @@ pub fn send_checkpoint_request_with_timeout(
     send_checkpoint_request_with_timeouts(socket_path, request, timeout, timeout)
 }
 
+pub fn send_link_checkpoint_request(
+    request: &crate::commit_links::checkpoint::LinkCheckpoint,
+) -> Result<(), GitAiError> {
+    let config = crate::commands::daemon::ensure_daemon_running(Duration::from_secs(5))
+        .map_err(GitAiError::Generic)?;
+    let response = send_checkpoint_request(&config.control_socket_path, request)?;
+    if response.ok && response.seq.is_some() {
+        Ok(())
+    } else {
+        Err(GitAiError::Generic(response.error.unwrap_or_else(|| {
+            "checkpoint acknowledgement missing".into()
+        })))
+    }
+}
+
+fn query_link_checkpoint<T: serde::de::DeserializeOwned>(
+    request: ControlRequest,
+) -> Result<T, GitAiError> {
+    let config = crate::commands::daemon::ensure_daemon_running(Duration::from_secs(5))
+        .map_err(GitAiError::Generic)?;
+    let response = send_control_request(&config.control_socket_path, &request)?;
+    if !response.ok {
+        return Err(GitAiError::Generic(
+            response
+                .error
+                .unwrap_or_else(|| "checkpoint query failed".into()),
+        ));
+    }
+    Ok(serde_json::from_value(
+        response.data.unwrap_or(Value::Null),
+    )?)
+}
+
+pub fn query_checkpoint_attachment(
+    worktree: &str,
+    session: &crate::commit_links::store::SessionIdentity,
+) -> Result<crate::commit_links::store::PendingState, GitAiError> {
+    query_link_checkpoint(ControlRequest::CheckpointAttachment {
+        repo_working_dir: worktree.into(),
+        session: session.clone(),
+    })
+}
+
+pub fn query_checkpoint_invocation(
+    worktree: &str,
+    session: &crate::commit_links::store::SessionIdentity,
+    invocation_id: &str,
+) -> Result<Option<crate::commit_links::checkpoint::ShellInvocationSnapshot>, GitAiError> {
+    query_link_checkpoint(ControlRequest::CheckpointInvocation {
+        repo_working_dir: worktree.into(),
+        session: session.clone(),
+        invocation_id: invocation_id.into(),
+    })
+}
+
 pub fn send_checkpoint_request(
     socket_path: &Path,
     request: &CheckpointRequest,
@@ -11553,9 +6904,6 @@ pub fn send_control_request_fire_and_forget(
 }
 
 #[cfg(test)]
-mod stream_worker_tests;
-
-#[cfg(test)]
 mod tests {
     impl ActorDaemonCoordinator {
         // Test-only views of the fence's candidate roots; production paths go
@@ -11588,7 +6936,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
-    use std::io::Write;
 
     #[test]
     fn secondary_def_repo_does_not_hint_worktree() {
@@ -11684,119 +7031,6 @@ mod tests {
             .expect("git stdout should be utf8")
             .trim()
             .to_string()
-    }
-
-    fn run_git_stdin_for_test(repo: &Path, args: &[&str], stdin: &str) -> String {
-        let mut child = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("git {:?} failed to spawn: {}", args, error));
-        child
-            .stdin
-            .take()
-            .expect("stdin should be piped")
-            .write_all(stdin.as_bytes())
-            .expect("write git stdin");
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|error| panic!("git {:?} failed to wait: {}", args, error));
-        assert!(
-            output.status.success(),
-            "git {:?} failed\nstdout: {}\nstderr: {}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("git stdout should be utf8")
-            .trim()
-            .to_string()
-    }
-
-    #[test]
-    fn conflict_resolution_note_read_errors_are_not_silently_ignored() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo_path = temp.path().join("repo");
-        std::fs::create_dir_all(&repo_path).unwrap();
-        run_git_for_test(&repo_path, &["init"]);
-        run_git_for_test(&repo_path, &["config", "user.name", "Test User"]);
-        run_git_for_test(&repo_path, &["config", "user.email", "test@example.com"]);
-
-        std::fs::write(repo_path.join("file.txt"), "onto\n").unwrap();
-        run_git_for_test(&repo_path, &["add", "file.txt"]);
-        run_git_for_test(&repo_path, &["commit", "-m", "onto"]);
-        let onto = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
-
-        std::fs::write(repo_path.join("file.txt"), "onto\nnew\n").unwrap();
-        run_git_for_test(&repo_path, &["add", "file.txt"]);
-        run_git_for_test(&repo_path, &["commit", "-m", "new"]);
-        let new_tip = run_git_for_test(&repo_path, &["rev-parse", "HEAD"]);
-
-        let missing_blob = "2222222222222222222222222222222222222222";
-        let prefix = &new_tip[..2];
-        let suffix = &new_tip[2..];
-        let leaf_tree = run_git_stdin_for_test(
-            &repo_path,
-            &["mktree", "--missing"],
-            &format!("100644 blob {missing_blob}\t{suffix}\n"),
-        );
-        let root_tree = run_git_stdin_for_test(
-            &repo_path,
-            &["mktree"],
-            &format!("040000 tree {leaf_tree}\t{prefix}\n"),
-        );
-        run_git_for_test(&repo_path, &["update-ref", "refs/notes/ai", &root_tree]);
-
-        let repo = crate::git::find_repository_in_path(repo_path.to_str().unwrap())
-            .expect("find test repository");
-        let result = process_conflict_resolution_working_logs(&repo, &new_tip, Some(&onto));
-        assert!(
-            result.is_err(),
-            "corrupt destination notes must fail closed instead of being treated as absent"
-        );
-    }
-
-    #[test]
-    fn revert_source_args_do_not_treat_bare_gpg_sign_as_value_option() {
-        assert_eq!(
-            revert_source_args_from_command_args(&["--gpg-sign".to_string(), "HEAD~1".to_string()]),
-            vec!["HEAD~1"]
-        );
-        assert_eq!(
-            revert_source_args_from_command_args(&["-S".to_string(), "HEAD~1".to_string()]),
-            vec!["HEAD~1"]
-        );
-        assert_eq!(
-            revert_source_args_from_command_args(&["-Smy-key".to_string(), "HEAD~1".to_string()]),
-            vec!["HEAD~1"]
-        );
-    }
-
-    #[test]
-    fn cherry_pick_source_args_do_not_treat_bare_gpg_sign_as_value_option() {
-        assert_eq!(
-            cherry_pick_source_args_from_command_args(&[
-                "--gpg-sign".to_string(),
-                "HEAD~1".to_string()
-            ]),
-            vec!["HEAD~1"]
-        );
-        assert_eq!(
-            cherry_pick_source_args_from_command_args(&["-S".to_string(), "HEAD~1".to_string()]),
-            vec!["HEAD~1"]
-        );
-        assert_eq!(
-            cherry_pick_source_args_from_command_args(&[
-                "-Smy-key".to_string(),
-                "HEAD~1".to_string()
-            ]),
-            vec!["HEAD~1"]
-        );
     }
 
     #[test]
@@ -11961,45 +7195,6 @@ mod tests {
         assert!(read_checkpoint_body(&mut missing_delimiter, 4).is_err());
     }
 
-    #[test]
-    fn transcript_sweep_triggers_for_commit_amend_and_push_events() {
-        use crate::daemon::domain::SemanticEvent;
-        use crate::daemon::stream_worker::SweepTrigger;
-
-        assert_eq!(
-            transcript_sweep_triggers_for_events(&[SemanticEvent::CommitCreated {
-                base: Some("base".to_string()),
-                new_head: "new".to_string(),
-            }]),
-            vec![SweepTrigger::PostCommit]
-        );
-        assert_eq!(
-            transcript_sweep_triggers_for_events(&[SemanticEvent::CommitAmended {
-                old_head: "old".to_string(),
-                new_head: "new".to_string(),
-            }]),
-            vec![SweepTrigger::PostCommit]
-        );
-        assert_eq!(
-            transcript_sweep_triggers_for_events(&[SemanticEvent::PushCompleted {
-                remote: Some("origin".to_string()),
-            }]),
-            vec![SweepTrigger::PostPush]
-        );
-        assert_eq!(
-            transcript_sweep_triggers_for_events(&[
-                SemanticEvent::CommitCreated {
-                    base: Some("base".to_string()),
-                    new_head: "new".to_string(),
-                },
-                SemanticEvent::PushCompleted {
-                    remote: Some("origin".to_string()),
-                },
-            ]),
-            vec![SweepTrigger::PostCommit, SweepTrigger::PostPush]
-        );
-    }
-
     fn test_rebase_command(
         invoked_args: &[&str],
         ref_changes: Vec<crate::daemon::domain::RefChange>,
@@ -12027,70 +7222,10 @@ mod tests {
             stash_target_oid: None,
             cherry_pick_source_oids: Vec::new(),
             revert_source_oids: Vec::new(),
+            merge_commit_oid: None,
             ref_changes,
             confidence: crate::daemon::domain::Confidence::High,
         }
-    }
-
-    fn ref_change(reference: &str, old: &str, new: &str) -> crate::daemon::domain::RefChange {
-        crate::daemon::domain::RefChange {
-            reference: reference.to_string(),
-            old: old.to_string(),
-            new: new.to_string(),
-        }
-    }
-
-    #[test]
-    fn explicit_branch_rebase_original_head_prefers_branch_ref_over_head() {
-        const MAIN: &str = "1111111111111111111111111111111111111111";
-        const FEATURE: &str = "2222222222222222222222222222222222222222";
-        const ONTO: &str = "3333333333333333333333333333333333333333";
-
-        let cmd = test_rebase_command(
-            &["master", "scenario-3-multi-file-conflict"],
-            vec![
-                ref_change("HEAD", MAIN, FEATURE),
-                ref_change("HEAD", FEATURE, ONTO),
-                ref_change(
-                    "refs/heads/scenario-3-multi-file-conflict",
-                    FEATURE,
-                    FEATURE,
-                ),
-            ],
-        );
-
-        assert_eq!(
-            strict_rebase_original_head_from_command(&cmd, MAIN),
-            Some(FEATURE.to_string()),
-            "explicit branch rebase must store the target branch tip, not the caller's original HEAD"
-        );
-    }
-
-    #[test]
-    fn pending_rebase_new_tip_prefers_matching_branch_ref_over_later_head_noise() {
-        const ORIGINAL: &str = "1111111111111111111111111111111111111111";
-        const ONTO: &str = "2222222222222222222222222222222222222222";
-        const NEW_TIP: &str = "3333333333333333333333333333333333333333";
-        const UNRELATED_HEAD: &str = "4444444444444444444444444444444444444444";
-
-        let cmd = test_rebase_command(
-            &["--continue"],
-            vec![
-                ref_change("HEAD", ONTO, NEW_TIP),
-                ref_change(
-                    "refs/heads/scenario-3-multi-file-conflict",
-                    ORIGINAL,
-                    NEW_TIP,
-                ),
-                ref_change("HEAD", NEW_TIP, UNRELATED_HEAD),
-            ],
-        );
-
-        assert_eq!(
-            rebase_new_tip_from_command(&cmd, ORIGINAL),
-            Some(NEW_TIP.to_string()),
-            "pending rebase completion must use the branch ref update that rewrote the original tip"
-        );
     }
 
     #[test]
@@ -12121,55 +7256,6 @@ mod tests {
         let _unset_legacy_test = EnvVarGuard::unset("GITAI_TEST_DB_PATH");
 
         assert!(!checkpoint_control_timeout_uses_ci_or_test_budget());
-    }
-
-    #[test]
-    fn compute_watermarks_uses_symlink_metadata_not_target_mtime() {
-        // Verify that compute_watermarks_from_stat uses lstat (symlink's own mtime)
-        // not stat (target file's mtime), consistent with snapshot's symlink_metadata.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-
-        // Create a target file
-        let target = dir.join("target.txt");
-        std::fs::write(&target, b"hello").unwrap();
-
-        // Create a symlink pointing to the target
-        let link = dir.join("link.txt");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&target, &link).unwrap();
-
-        // Watermark the symlink
-        let wm = compute_watermarks_from_stat(dir.to_str().unwrap(), &["link.txt".to_string()]);
-
-        // The watermark should match symlink_metadata mtime, not target metadata mtime.
-        let symlink_meta = std::fs::symlink_metadata(&link).unwrap();
-        let target_meta = std::fs::metadata(&link).unwrap(); // follows symlink
-
-        let symlink_mtime = symlink_meta
-            .modified()
-            .unwrap()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let target_mtime = target_meta
-            .modified()
-            .unwrap()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-
-        let recorded = *wm.get("link.txt").unwrap();
-
-        assert_eq!(
-            recorded, symlink_mtime,
-            "watermark should match lstat mtime of the symlink itself"
-        );
-        // This assertion documents the intent: if symlink and target mtimes differ,
-        // the watermark must track the symlink, not the target.
-        let _ = target_mtime; // used only as documentation; may equal symlink_mtime on some FS
     }
 
     #[test]
@@ -12917,56 +8003,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untraced_fixup_tick_leaves_a_family_alone_while_its_git_command_is_in_flight() {
-        let coord = Arc::new(ActorDaemonCoordinator::new());
-        // Outside the OS temp dir, which the fixup ignores by default.
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("untraced-tick-tests");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let temp = tempfile::tempdir_in(&scratch).unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        coord
-            .status_for_family(repo.to_string_lossy().to_string())
-            .await
-            .unwrap();
-        let family = coord.backend.resolve_family(&repo).unwrap().0;
-        // Not a maintenance round (those re-read the config).
-        coord
-            .untraced_store_last_maintenance_secs
-            .store(crate::utils::unix_timestamp_now(), Ordering::Relaxed);
-
-        // A `git commit` of this family is still running.
-        let sid = "20260411T120000.000000-Psid1";
-        {
-            let mut ingress = coord.trace_ingress_state.lock().unwrap();
-            ingress.root_open_connections.insert(sid.to_string(), 1);
-            ingress.root_mutating.insert(sid.to_string(), true);
-            ingress
-                .root_families
-                .insert(sid.to_string(), family.clone());
-        }
-        let busy = coord.run_untraced_fixup_tick().await.unwrap();
-        assert_eq!(
-            (busy.worktrees, busy.deferred),
-            (0, 1),
-            "a scan must not queue behind an in-flight command: {busy:?}"
-        );
-
-        // Once the command is gone the next tick scans the worktree.
-        {
-            let mut ingress = coord.trace_ingress_state.lock().unwrap();
-            ingress.root_open_connections.remove(sid);
-            ingress.root_mutating.remove(sid);
-            ingress.root_families.remove(sid);
-        }
-        let quiet = coord.run_untraced_fixup_tick().await.unwrap();
-        assert_eq!((quiet.worktrees, quiet.deferred), (1, 0), "{quiet:?}");
-    }
-
-    #[tokio::test]
     async fn trace_connection_close_without_atexit_releases_family_fence() {
         let coord = Arc::new(ActorDaemonCoordinator::new());
         coord.start_trace_ingest_worker().unwrap();
@@ -13573,7 +8609,7 @@ mod tests {
             .record_side_effect_error(
                 "family-errors",
                 7,
-                &GitAiError::Generic("notes push rejected".to_string()),
+                &GitAiError::Generic("link persistence failed".to_string()),
             )
             .unwrap();
         let snapshot = DaemonHealthSnapshot::capture(&coord);

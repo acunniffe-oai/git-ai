@@ -1,38 +1,23 @@
 # OTLP commit links
 
-Configuring the backend `api_key` automatically enables the independent OTLP
-outbox. Git AI sends only `git_ai.session.linked_commit`, one record per supported
-agent session and commit SHA. Rebase, amend, cherry-pick, squash, and other
-authorship-note rewrites produce new links even when the stable patch ID matches
-an earlier commit.
+Git AI v2 records local native-agent session-to-commit links in SQLite and sends `git_ai.session.linked_commit`. Git Notes and local transcript processing are not used.
 
-The destination is the origin of `api_base_url` plus
-`/api/otel/git-ai/v1/logs`. Any base URL path prefix is replaced. Requests use
-OTLP/JSON and `Authorization: Bearer <api_key>`; OAuth login alone does not enable
-this outbox. The notes backend URL does not select the OTLP destination.
+## Contribution model
 
-Both HTTP and Git notes trigger links. Claude (`claude` internally) is sent as
-`claude-code`; Codex, Devin, `github-copilot` (VS Code), and `github-copilot-cli` retain their tool names. Session IDs are the
-agents' original IDs. Unsupported agents, known placeholder IDs, empty patches,
-and records missing required commit metadata are skipped. Optional branch and
-user-email attributes are omitted. Prompts, diffs, usage data, and custom
-attributes are not sent.
+A confirmed agent write adds its original session ID to the current worktree’s pending set. The next successful commit consumes that set and records links. Repeated write hooks in the same window skip further work. The signal is repository-level: partial staging, excluded files, and later reverted edits do not remove it. Separate linked worktrees have separate pending sets.
 
-The daemon captures successful note writes and the trace command's completion
-time, then enriches the whole operation in a fixed number of Git calls. Neither
-enrichment nor delivery runs on trace ingestion. Source batches and prepared
-records live in `~/.git-ai/internal/otel-db`; delivery is independent of notes and
-metrics uploads. A separate bounded pool keeps durable source writes moving even
-when both uploaders stall. There is no historical backfill.
+Shell hooks use bounded pre/post filesystem metadata, without content reads. Once attached, they skip the scan. A writing shell call links its session to the commits created within that call, including when the post-hook arrives after those commits. It does not also attach the next unrelated commit. Missing write evidence fails closed.
 
-Successful records are retained for deduplication. Network errors, HTTP 429, and
-5xx responses retry with capped exponential backoff. HTTP 413 splits batches;
-an oversized individual record is parked. HTTP 401 waits for a changed API key.
-Other unsuccessful responses are retained as failures without automatic retry.
-Queued records stay bound to their original endpoint if configuration changes.
+Rewrites copy locally known links to new SHAs, and squash or ambiguous rewrites union affected sessions. Old SHA links remain. Stash and reset preserve pending sets where work is retained. No historical v1 notes are imported and no cross-machine note synchronization occurs.
 
-`git-ai await` flushes this queue too and reports remaining and failed OTLP work.
-It does not report completion while the active destination has undelivered
-records, including records waiting for retry or credential repair. The daemon
-log records preparation, persistence, and delivery errors. Transport retries
-reuse the original payload and timestamp; delivery is at least once.
+## Export
+
+Configuring `api_key` enables delivery to the origin of `api_base_url` plus `/api/otel/git-ai/v1/logs`. Requests use OTLP/JSON and `Authorization: Bearer <api_key>`. OAuth login alone does not enable delivery. Local links persist even without a key; enabling it does not backfill history.
+
+The existing payload contains canonical agent name, original session ID, commit SHA, stable patch ID, author email, subject, body, and repository URL when known. Claude is named `claude-code`. Native agent presets are supported without reading transcripts. Missing/placeholder IDs, empty patches, and missing required commit metadata are not exported; local links remain available.
+
+Commit metadata and patch IDs are prepared with batched Git commands outside trace ingestion. The SQLite database remains `~/.git-ai/internal/otel-db`; its schema migration preserves existing queued and delivered outbox records. Link changes, operation completion, pending-set consumption, and new export work are transactional.
+
+Network failures, 429 and 5xx retry with capped backoff; 413 splits batches; an oversized single record is parked. A 401 waits for a changed API key. Other failures are retained without automatic retries. Records remain bound to their original endpoint. Retries preserve the original payload and event time. Delivery is at least once.
+
+`git-ai await` drains processing and OTEL delivery and reports remaining or failed work. `git-ai debug` checks trace2 transport and local session linking. Old notes, working logs, and transcript databases are left untouched but unused.

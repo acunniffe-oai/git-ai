@@ -1,14 +1,13 @@
-//! Durable source batches and immutable OTLP records. Never share delivery state
-//! with the notes or metrics queues.
+//! Durable local session links, source batches, and immutable OTLP records.
 use crate::error::GitAiError;
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-pub(super) struct Outbox {
-    conn: Connection,
+pub(crate) struct Outbox {
+    pub(crate) conn: Connection,
 }
 
-pub(super) struct Row {
+pub(crate) struct Row {
     pub id: i64,
     pub payload: String,
 }
@@ -25,6 +24,10 @@ impl Outbox {
         if let Some(path) = std::env::var_os("GIT_AI_TEST_OTEL_DB_PATH") {
             return Self::open_at(Path::new(&path));
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(path) = std::env::var_os("GIT_AI_TEST_DB_PATH") {
+            return Self::open_at(&Path::new(&path).with_extension("otel-db"));
+        }
         let home = dirs::home_dir()
             .ok_or_else(|| GitAiError::Generic("Could not determine home directory".into()))?;
         Self::open_at(&home.join(".git-ai/internal/otel-db"))
@@ -36,10 +39,14 @@ impl Outbox {
         }
         let conn = crate::sqlite::open_with_memory_limits(path)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 1 {
+        if version > 3 {
             return Err(GitAiError::Generic(format!(
                 "Unsupported OTLP outbox schema version {version}"
             )));
+        }
+        if version == 3 {
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            return Ok(Self { conn });
         }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -62,11 +69,61 @@ impl Outbox {
              CREATE INDEX IF NOT EXISTS outbox_state ON outbox(endpoint, state);
              CREATE INDEX IF NOT EXISTS outbox_remaining ON outbox(endpoint, state)
                 WHERE state != 'delivered';
-             PRAGMA user_version=1;",
+             CREATE TABLE IF NOT EXISTS link_worktrees (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(family, worktree)
+             );
+             CREATE TABLE IF NOT EXISTS pending_sessions (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, generation INTEGER NOT NULL,
+                agent TEXT NOT NULL, session_id TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, generation, agent, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS deferred_sessions (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, operation_kind TEXT NOT NULL,
+                agent TEXT NOT NULL, session_id TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, operation_kind, agent, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS operation_sources (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, operation_kind TEXT NOT NULL,
+                source_oids TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, operation_kind)
+             );
+             CREATE TABLE IF NOT EXISTS commit_sessions (
+                family TEXT NOT NULL, commit_sha TEXT NOT NULL, agent TEXT NOT NULL, session_id TEXT NOT NULL,
+                PRIMARY KEY(family, commit_sha, agent, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS link_operations (
+                family TEXT NOT NULL, operation_id TEXT NOT NULL, worktree TEXT NOT NULL,
+                PRIMARY KEY(family, operation_id)
+             );
+             CREATE TABLE IF NOT EXISTS rewrite_links (
+                family TEXT NOT NULL, source_sha TEXT NOT NULL, destination_sha TEXT NOT NULL,
+                PRIMARY KEY(family, source_sha, destination_sha)
+             );
+             CREATE TABLE IF NOT EXISTS stash_sessions (
+                family TEXT NOT NULL, stash_oid TEXT NOT NULL, agent TEXT NOT NULL, session_id TEXT NOT NULL,
+                PRIMARY KEY(family, stash_oid, agent, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS link_invocations (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, invocation_id TEXT NOT NULL,
+                agent TEXT NOT NULL, session_id TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, invocation_id)
+             );
+             CREATE TABLE IF NOT EXISTS invocation_commits (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, invocation_id TEXT NOT NULL, commit_sha TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, invocation_id, commit_sha)
+             );
+             CREATE TABLE IF NOT EXISTS created_commits (
+                family TEXT NOT NULL, worktree TEXT NOT NULL, commit_sha TEXT NOT NULL,
+                started_at_ns TEXT NOT NULL, finished_at_ns TEXT NOT NULL,
+                PRIMARY KEY(family, worktree, commit_sha)
+             );
+             PRAGMA user_version=3;",
         )?;
         Ok(Self { conn })
     }
 
+    #[cfg(test)]
     pub fn enqueue_sources(
         &mut self,
         endpoint: &str,
@@ -180,6 +237,72 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_schema2_migration_preserves_links_and_adds_ordered_operation_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox");
+        let db = Outbox::open_at(&path).unwrap();
+        db.conn.execute("INSERT INTO commit_sessions(family,commit_sha,agent,session_id) VALUES ('family','sha','codex','raw-id')",[]).unwrap();
+        db.conn
+            .execute_batch("DROP TABLE operation_sources; PRAGMA user_version=2;")
+            .unwrap();
+        drop(db);
+        let db = Outbox::open_at(&path).unwrap();
+        let session: String = db
+            .conn
+            .query_row("SELECT session_id FROM commit_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(session, "raw-id");
+        let source_count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM operation_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_count, 0);
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn v2_schema_migration_preserves_delivered_outbox_and_starts_without_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox");
+        let mut db = Outbox::open_at(&path).unwrap();
+        db.prepared(-1, "endpoint", &[("old".into(), "old payload".into())])
+            .unwrap();
+        let row = db.claim("endpoint", "record", 1, 0).unwrap().remove(0);
+        db.finish(&[row.id], "delivered", "", "key", 0).unwrap();
+        db.conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(db);
+
+        let db = Outbox::open_at(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let row: (String, String) = db
+            .conn
+            .query_row(
+                "SELECT payload, state FROM outbox WHERE identity='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("old payload".into(), "delivered".into()));
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM commit_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 
     #[test]
     fn otel_outbox_survives_restart_and_keeps_first_delivered_identity() {

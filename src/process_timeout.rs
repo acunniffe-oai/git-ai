@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,31 @@ pub(crate) struct TimedCommandOutput {
     pub timed_out: bool,
     pub diagnostics: Vec<String>,
     pub wait_error: Option<String>,
+}
+
+/// Raw output from an already-started child. Output draining stays bounded even
+/// when a descendant inherits the child's stdout or stderr handles.
+#[derive(Debug)]
+pub struct TimedChildOutput {
+    pub status: Option<ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+    pub diagnostics: Vec<String>,
+    pub wait_error: Option<String>,
+}
+
+impl TimedChildOutput {
+    fn into_text(self) -> TimedCommandOutput {
+        TimedCommandOutput {
+            status: self.status.and_then(|status| status.code()),
+            stdout: String::from_utf8_lossy(&self.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&self.stderr).trim().to_string(),
+            timed_out: self.timed_out,
+            diagnostics: self.diagnostics,
+            wait_error: self.wait_error,
+        }
+    }
 }
 
 enum OutputEvent {
@@ -42,14 +67,14 @@ impl OutputState {
 
     fn finish(
         self,
-        status: Option<i32>,
+        status: Option<ExitStatus>,
         timed_out: bool,
         wait_error: Option<String>,
-    ) -> TimedCommandOutput {
-        TimedCommandOutput {
+    ) -> TimedChildOutput {
+        TimedChildOutput {
             status,
-            stdout: String::from_utf8_lossy(&self.stdout).trim().to_string(),
-            stderr: String::from_utf8_lossy(&self.stderr).trim().to_string(),
+            stdout: self.stdout,
+            stderr: self.stderr,
             timed_out,
             diagnostics: self.diagnostics,
             wait_error,
@@ -92,10 +117,20 @@ pub(crate) fn run_command_with_timeout_and_env(
         command.current_dir(cwd);
     }
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|e| format!("failed to execute: {}", e))?;
 
+    Ok(collect_child_output_with_timeout(child, timeout, poll_interval).into_text())
+}
+
+/// Collect a piped child while preserving its status and raw output bytes.
+/// A finished child receives the same short drain grace used by diagnostics.
+pub fn collect_child_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> TimedChildOutput {
     let (tx, rx) = mpsc::channel();
     let mut output = OutputState::default();
     match child.stdout.take() {
@@ -124,7 +159,7 @@ pub(crate) fn run_command_with_timeout_and_env(
                         "output collection did not finish after the child exited; descendant processes may still be holding stdout/stderr open".to_string(),
                     );
                 }
-                return Ok(output.finish(status.code(), false, None));
+                return output.finish(Some(status), false, None);
             }
             Ok(None) if start.elapsed() >= timeout => {
                 let kill_result = child.kill();
@@ -147,7 +182,7 @@ pub(crate) fn run_command_with_timeout_and_env(
                                 .map(|code| code.to_string())
                                 .unwrap_or_else(|| "signal".to_string())
                         ));
-                        status.code()
+                        Some(status)
                     }
                     Err(e) => {
                         output
@@ -168,7 +203,7 @@ pub(crate) fn run_command_with_timeout_and_env(
                         "output collection incomplete after timeout; descendant processes may still be holding stdout/stderr open".to_string(),
                     );
                 }
-                return Ok(output.finish(status, true, None));
+                return output.finish(status, true, None);
             }
             Ok(None) => {
                 std::thread::sleep(poll_interval);
@@ -182,7 +217,7 @@ pub(crate) fn run_command_with_timeout_and_env(
                     Instant::now() + OUTPUT_DRAIN_GRACE,
                     OUTPUT_DRAIN_POLL,
                 );
-                return Ok(output.finish(None, false, Some(e.to_string())));
+                return output.finish(None, false, Some(e.to_string()));
             }
         }
     }

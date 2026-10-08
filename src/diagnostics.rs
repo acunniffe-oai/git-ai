@@ -1,6 +1,4 @@
-use crate::authorship::working_log::CheckpointKind;
-use crate::commands::blame::{BlameAnalysisResult, GitAiBlameOptions};
-use crate::config::Config;
+use crate::commit_links::store::{LinkStore, SessionIdentity};
 use crate::daemon::control_api::{ControlRequest, FamilyStatus};
 use crate::diagnostic_sentinels::{
     DEBUG_SELF_CHECK_REMOTE_URL, debug_self_check_root, path_is_in_debug_self_check_root,
@@ -13,9 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SELF_CHECK_FILE: &str = "git-ai-debug-self-check.txt";
-const SELF_CHECK_CONTENT_UNTRACKED: &str = "Untracked line\n";
-const SELF_CHECK_CONTENT_KNOWN_HUMAN: &str = "Untracked line\nKnown human line\n";
-const SELF_CHECK_CONTENT_AI: &str = "Untracked line\nKnown human line\nAI line\n";
+const SELF_CHECK_CONTENT: &str = "Native agent session-link diagnostic\n";
 const TRACE2_EVENT_TARGET_KEY: &str = "trace2.eventTarget";
 const TRACE2_EVENT_NESTING_KEY: &str = "trace2.eventNesting";
 const TRACE2_EVENT_NESTING_VALUE: &str = "0";
@@ -330,7 +326,7 @@ pub fn check_trace2_global_config(target: &GitDiagnosticTarget) -> DiagnosticChe
     )
 }
 
-pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
+pub fn run_session_link_self_check(target: &GitDiagnosticTarget) -> DiagnosticCheckResult {
     let mut commands = Vec::new();
     let repo_path = debug_self_check_root().join(format!(
         "{}-{}",
@@ -338,6 +334,11 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
         crate::uuid::generate_v4()
     ));
     let file_path = repo_path.join(SELF_CHECK_FILE);
+    let session = SessionIdentity::new(
+        "claude",
+        &format!("git-ai-debug-{}", crate::uuid::generate_v4()),
+    )
+    .unwrap();
 
     let result = (|| -> Result<Vec<String>, String> {
         fs::create_dir_all(&repo_path)
@@ -368,20 +369,15 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
             Some(&repo_path),
         )?;
 
-        fs::write(&file_path, SELF_CHECK_CONTENT_UNTRACKED)
+        fs::write(&file_path, SELF_CHECK_CONTENT)
             .map_err(|e| format!("failed to write {}: {}", file_path.display(), e))?;
-        run_git_ai_checkpoint(&mut commands, &repo_path, "human")?;
-        wait_for_checkpoint_count(&repo_path, 1)?;
-
-        fs::write(&file_path, SELF_CHECK_CONTENT_KNOWN_HUMAN)
-            .map_err(|e| format!("failed to write {}: {}", file_path.display(), e))?;
-        run_git_ai_checkpoint(&mut commands, &repo_path, "mock_known_human")?;
-        wait_for_checkpoint_count(&repo_path, 2)?;
-
-        fs::write(&file_path, SELF_CHECK_CONTENT_AI)
-            .map_err(|e| format!("failed to write {}: {}", file_path.display(), e))?;
-        run_git_ai_checkpoint(&mut commands, &repo_path, "mock_ai")?;
-        wait_for_checkpoint_count(&repo_path, 3)?;
+        run_git_ai_checkpoint(&mut commands, &repo_path, &session.id)?;
+        let state =
+            crate::daemon::query_checkpoint_attachment(&repo_path.to_string_lossy(), &session)
+                .map_err(|error| error.to_string())?;
+        if !state.attached {
+            return Err("native write hook did not attach its session".to_string());
+        }
 
         run_required(
             &mut commands,
@@ -406,24 +402,23 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
         .trim()
         .to_string();
 
-        // Attribution is produced asynchronously after the commit. Give that
-        // phase its own bounded budget instead of sharing the setup deadline.
-        let attribution_deadline = Instant::now() + DEBUG_CHECK_TIMEOUT;
-        let mut details =
-            poll_self_check_attribution(&repo_path, &commit_sha, attribution_deadline)?;
+        // Commit links are asynchronous. Setup commands each retain their own
+        // timeout, and link processing receives a separate bounded budget.
+        let mut details = poll_self_check_links(
+            &repo_path,
+            &commit_sha,
+            &session,
+            Instant::now() + DEBUG_CHECK_TIMEOUT,
+        )?;
         details.insert(0, format!("repo: {}", repo_path.display()));
         details.insert(1, format!("commit: {}", commit_sha));
-        details.insert(
-            2,
-            format!("notes backend: {}", Config::get().notes_backend_kind()),
-        );
         Ok(details)
     })();
 
     match result {
         Ok(details) => {
             let _ = fs::remove_dir_all(&repo_path);
-            DiagnosticCheckResult::passed("attribution self-check completed", details, commands)
+            DiagnosticCheckResult::passed("session-link self-check completed", details, commands)
         }
         Err(err) => {
             let mut details = vec![format!("repo: {}", repo_path.display()), err];
@@ -433,7 +428,7 @@ pub fn run_attribution_self_check(target: &GitDiagnosticTarget) -> DiagnosticChe
                     "failed self-check repository was left in place for inspection".to_string(),
                 );
             }
-            DiagnosticCheckResult::failed("attribution self-check failed", details, commands)
+            DiagnosticCheckResult::failed("session-link self-check failed", details, commands)
         }
     }
 }
@@ -594,15 +589,22 @@ fn run_daemon_trace2_ingestion_probe(
 fn run_git_ai_checkpoint(
     commands: &mut Vec<CommandRecord>,
     repo_path: &Path,
-    preset: &str,
+    session_id: &str,
 ) -> Result<CommandRecord, String> {
     let git_ai = std::env::current_exe()
         .map_err(|e| format!("failed to resolve git-ai binary path: {}", e))?;
     let git_ai = git_ai.to_string_lossy().to_string();
+    let hook = serde_json::json!({
+        "session_id": session_id, "cwd": repo_path,
+        "hook_event_name": "PostToolUse", "tool_name": "Write",
+        "tool_use_id": "self-check-write",
+        "tool_input": {"file_path": repo_path.join(SELF_CHECK_FILE)}
+    })
+    .to_string();
     run_required(
         commands,
         &git_ai,
-        &["checkpoint", preset, SELF_CHECK_FILE],
+        &["checkpoint", "claude", "--hook-input", &hook],
         Some(repo_path),
     )
 }
@@ -775,91 +777,37 @@ fn remaining_timeout(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-fn wait_for_checkpoint_count(repo_path: &Path, expected_min_count: usize) -> Result<(), String> {
-    let start = Instant::now();
-    let deadline = start + DEBUG_CHECK_TIMEOUT;
-    let mut last_error = None;
-
-    while Instant::now() < deadline {
-        match read_checkpoint_count(repo_path) {
-            Ok(count) if count >= expected_min_count => return Ok(()),
-            Ok(count) => {
-                last_error = Some(format!(
-                    "only {} checkpoint(s) visible, expected at least {}",
-                    count, expected_min_count
-                ));
-            }
-            Err(e) => last_error = Some(e),
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-
-    Err(format!(
-        "timed out after {:.1}s waiting for checkpoint persistence: {}",
-        start.elapsed().as_secs_f64(),
-        last_error.unwrap_or_else(|| {
-            format!(
-                "no checkpoint status available for repo {}",
-                repo_path.display()
-            )
-        })
-    ))
-}
-
-fn read_checkpoint_count(repo_path: &Path) -> Result<usize, String> {
-    let repo = discover_repository_in_path_no_git_exec(repo_path).map_err(|e| e.to_string())?;
-    let working_log = repo
-        .storage
-        .working_log_for_base_commit("initial")
-        .map_err(|e| e.to_string())?;
-    working_log
-        .read_all_checkpoints()
-        .map(|checkpoints| checkpoints.len())
-        .map_err(|e| e.to_string())
-}
-
-fn poll_self_check_attribution(
+fn poll_self_check_links(
     repo_path: &Path,
     commit_sha: &str,
+    session: &SessionIdentity,
     deadline: Instant,
 ) -> Result<Vec<String>, String> {
-    let start = Instant::now();
-    let repo = discover_repository_in_path_no_git_exec(repo_path).map_err(|e| e.to_string())?;
-    let notes_backend = Config::get().notes_backend_kind();
-    let mut last_error = None;
-
-    while Instant::now() < deadline {
-        match validate_self_check_blame_analysis(
-            repo.blame_analysis(SELF_CHECK_FILE, &self_check_blame_options(commit_sha))
-                .map_err(|e| e.to_string()),
-        ) {
-            Ok(details) => return Ok(details),
-            Err(err) => last_error = Some(err),
+    let repo =
+        discover_repository_in_path_no_git_exec(repo_path).map_err(|error| error.to_string())?;
+    let family = repo
+        .common_dir()
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let store = LinkStore::open().map_err(|error| error.to_string())?;
+    let expected = std::collections::BTreeSet::from([session.clone()]);
+    loop {
+        let actual = store
+            .sessions_for_commit(&family.to_string_lossy(), commit_sha)
+            .map_err(|error| error.to_string())?;
+        if actual == expected {
+            return Ok(vec![
+                format!("session: {}/{}", session.agent, session.id),
+                "linked sessions: 1".to_string(),
+            ]);
         }
-
-        if remaining_timeout(deadline).is_zero() {
-            break;
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for session {}/{} on commit {commit_sha}; actual links: {actual:?}",
+                session.agent, session.id
+            ));
         }
         std::thread::sleep(POLL_INTERVAL);
-    }
-
-    Err(format!(
-        "timed out after {:.1}s waiting for expected attribution via {} backend for {} in {}: {}",
-        start.elapsed().as_secs_f64(),
-        notes_backend,
-        commit_sha,
-        repo_path.display(),
-        last_error.unwrap_or_else(|| "no blame analysis result available".to_string())
-    ))
-}
-
-fn self_check_blame_options(commit_sha: &str) -> GitAiBlameOptions {
-    GitAiBlameOptions {
-        line_ranges: vec![(1, 3)],
-        newest_commit: Some(commit_sha.to_string()),
-        use_prompt_hashes_as_names: true,
-        return_human_authors_as_human: true,
-        ..GitAiBlameOptions::default()
     }
 }
 
@@ -982,103 +930,6 @@ fn system_time_to_unix_nanos(time: SystemTime) -> Option<u128> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_nanos())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineClassification {
-    Untracked,
-    KnownHuman,
-    Ai,
-    Unknown,
-}
-
-impl LineClassification {
-    fn as_str(self) -> &'static str {
-        match self {
-            LineClassification::Untracked => "untracked",
-            LineClassification::KnownHuman => "known_human",
-            LineClassification::Ai => "ai",
-            LineClassification::Unknown => "unknown",
-        }
-    }
-}
-
-fn validate_self_check_blame_analysis(
-    analysis: Result<BlameAnalysisResult, String>,
-) -> Result<Vec<String>, String> {
-    let analysis = analysis.map_err(|err| format!("blame analysis failed: {}", err))?;
-    let expected = [
-        (1, LineClassification::Untracked),
-        (2, LineClassification::KnownHuman),
-        (3, LineClassification::Ai),
-    ];
-    let mut details = Vec::new();
-
-    for (line, expected_class) in expected {
-        let actual = classify_line(&analysis, line);
-        let raw_author = analysis
-            .line_authors
-            .get(&line)
-            .cloned()
-            .unwrap_or_else(|| "<missing>".to_string());
-        details.push(format!(
-            "line {}: {} (expected {}, raw={})",
-            line,
-            actual.as_str(),
-            expected_class.as_str(),
-            raw_author
-        ));
-        if actual != expected_class {
-            return Err(format!(
-                "unexpected attribution for line {}: got {}, expected {}\n{}",
-                line,
-                actual.as_str(),
-                expected_class.as_str(),
-                format_blame_analysis_debug(&analysis)
-            ));
-        }
-    }
-
-    details.push(format_blame_analysis_debug(&analysis));
-    Ok(details)
-}
-
-fn classify_line(analysis: &BlameAnalysisResult, line: u32) -> LineClassification {
-    let Some(author) = analysis.line_authors.get(&line) else {
-        return LineClassification::Unknown;
-    };
-
-    if author == &CheckpointKind::Human.to_str() {
-        return LineClassification::Untracked;
-    }
-
-    if author.starts_with("h_") && analysis.humans.contains_key(author) {
-        return LineClassification::KnownHuman;
-    }
-
-    if analysis
-        .prompt_records
-        .get(author)
-        .is_some_and(|prompt| prompt.agent_id.tool == "mock_ai")
-    {
-        return LineClassification::Ai;
-    }
-
-    LineClassification::Unknown
-}
-
-fn format_blame_analysis_debug(analysis: &BlameAnalysisResult) -> String {
-    let mut prompt_keys = analysis.prompt_records.keys().cloned().collect::<Vec<_>>();
-    prompt_keys.sort();
-    let mut session_keys = analysis.session_records.keys().cloned().collect::<Vec<_>>();
-    session_keys.sort();
-    let mut human_keys = analysis.humans.keys().cloned().collect::<Vec<_>>();
-    human_keys.sort();
-
-    format!(
-        "blame analysis: line_authors={:?}, prompt_keys={:?}, session_keys={:?}, human_keys={:?}",
-        analysis.line_authors, prompt_keys, session_keys, human_keys
-    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1285,7 +1136,7 @@ fn trace2_config_failure_details(
 ) -> Vec<String> {
     let mut details = vec![
         format!("ERROR: {}", reason),
-        "Why this matters: git-ai daemon mode relies on Git trace2 events to match real Git commands to checkpoint and authorship state; without this config, commit/rebase/merge attribution can be missed or delayed.".to_string(),
+        "Why this matters: git-ai daemon mode relies on Git trace2 events to match real Git commands to session contributions; without this config, commit and rewrite links can be missed or delayed.".to_string(),
     ];
 
     if let Some(expected_target) = expected_target {
