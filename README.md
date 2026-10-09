@@ -6,7 +6,7 @@ Native agent hooks report whether a session wrote to a repository. A shared daem
 
 ## Install and configure
 
-Use the project’s platform installer, then configure your backend endpoint and API key with `git-ai install --api-base <url> --api-key <key>`. Installation configures native agent hooks, Git trace2, and supported native agent OTEL settings.
+Use the project’s platform installer, then configure your backend endpoint and API key with `git-ai install-hooks <api-base-url> <token>` (either order) or `git-ai install --api-base <url> --api-key <key>`. Installation configures native agent hooks, Git trace2, and supported native agent OTEL settings.
 
 ```sh
 git-ai config          # inspect configuration

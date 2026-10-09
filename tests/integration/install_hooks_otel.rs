@@ -259,6 +259,50 @@ fn install_hooks_otel_environment_key_wins_over_installer_and_saved_key() {
 }
 
 #[test]
+fn install_hooks_positional_token_and_api_base_are_saved_in_either_order() {
+    for base_first in [false, true] {
+        let mut f = Fixture::new(None);
+        let base = f.server.url();
+        let mock = f.mock(f.response("off", TOKEN), TOKEN, 1);
+        let args = if base_first {
+            vec![base.as_str(), TOKEN]
+        } else {
+            vec![TOKEN, base.as_str()]
+        };
+
+        let output = f.run(&args);
+
+        mock.assert();
+        assert!(!output.contains(TOKEN), "{output}");
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(f.config_path()).unwrap()).unwrap();
+        assert_eq!(config["api_key"], TOKEN);
+        assert_eq!(config["api_base_url"], base);
+    }
+}
+
+#[test]
+fn install_hooks_accepts_each_positional_credential_on_its_own() {
+    let mut token_fixture = Fixture::new(None);
+    let token_mock = token_fixture.mock(token_fixture.response("off", TOKEN), TOKEN, 1);
+    token_fixture.run(&[TOKEN]);
+    token_mock.assert();
+    let token_config: Value =
+        serde_json::from_str(&fs::read_to_string(token_fixture.config_path()).unwrap()).unwrap();
+    assert_eq!(token_config["api_key"], TOKEN);
+
+    let mut base_fixture = Fixture::new(Some(TOKEN));
+    let base = base_fixture.server.url();
+    let base_mock = base_fixture.mock(base_fixture.response("off", TOKEN), TOKEN, 1);
+    base_fixture.run(&[&base]);
+    base_mock.assert();
+    let base_config: Value =
+        serde_json::from_str(&fs::read_to_string(base_fixture.config_path()).unwrap()).unwrap();
+    assert_eq!(base_config["api_base_url"], base);
+    assert_eq!(base_config["api_key"], TOKEN);
+}
+
+#[test]
 fn install_hooks_otel_failures_warn_and_preserve_otel_while_installing_hooks() {
     for (status, body) in [
         (401, "private-response"),

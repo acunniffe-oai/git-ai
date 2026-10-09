@@ -415,6 +415,8 @@ fn run_hooks_install(options: &InstallOptions) -> Result<HashMap<String, String>
 
 fn parse_install_options(args: &[String]) -> Result<InstallOptions, GitAiError> {
     let mut options = InstallOptions::default();
+    let mut positional_api_base = None;
+    let mut positional_api_key = None;
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -444,9 +446,28 @@ fn parse_install_options(args: &[String]) -> Result<InstallOptions, GitAiError> 
                 })?;
                 options.api_key = non_empty_value(value);
             }
+            value if value.starts_with("http://") || value.starts_with("https://") => {
+                if positional_api_base.is_some() {
+                    return Err(GitAiError::Generic(
+                        "only one positional API base URL is supported".to_string(),
+                    ));
+                }
+                positional_api_base = Some(value.to_string());
+            }
+            value if !value.starts_with('-') => {
+                if positional_api_key.is_some() {
+                    return Err(GitAiError::Generic(
+                        "only one positional API token is supported".to_string(),
+                    ));
+                }
+                positional_api_key = Some(value.to_string());
+            }
             _ => {}
         }
     }
+
+    options.api_base = options.api_base.or(positional_api_base);
+    options.api_key = options.api_key.or(positional_api_key);
 
     Ok(options)
 }
@@ -1233,6 +1254,21 @@ mod tests {
             Some("https://enterprise.example")
         );
         assert_eq!(options.api_key.as_deref(), Some("sk-enterprise-key"));
+    }
+
+    #[test]
+    fn parse_install_options_prefers_named_api_values_over_positionals() {
+        let args = vec![
+            "--api-key=flag-key".to_string(),
+            "positional-key".to_string(),
+            "https://positional.example".to_string(),
+            "--api-base=https://flag.example".to_string(),
+        ];
+
+        let options = parse_install_options(&args).unwrap();
+
+        assert_eq!(options.api_key.as_deref(), Some("flag-key"));
+        assert_eq!(options.api_base.as_deref(), Some("https://flag.example"));
     }
 
     #[test]

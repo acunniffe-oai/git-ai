@@ -45,7 +45,7 @@ fn print_help() {
     eprintln!("git-ai - link agent sessions to commits");
     eprintln!("\nUsage: git-ai <command> [args...]\n");
     eprintln!("  checkpoint <agent> --hook-input <json|stdin>  Record an agent write");
-    eprintln!("  install, install-hooks      Configure agent hooks and native telemetry");
+    eprintln!("  install, install-hooks [api-base-url] [token]  Configure hooks and telemetry");
     eprintln!("  uninstall, uninstall-hooks  Remove managed hooks");
     eprintln!("  config                      Manage configuration");
     eprintln!("  daemon, bg                  Control the background service");
