@@ -10,14 +10,16 @@ the server’s version-1 `agents.codex.otel`, `agents.claude.env`, and `agents.c
 respective entry has `enabled: true`. Prompt and tool-content capture follow the
 server-provided settings exactly.
 
-An API key supplied by `--api-key` or `API_KEY` is saved and used during that same
-installation. `GIT_AI_API_KEY` takes precedence over the saved key, including a
-key just supplied by the installer. `--api-base` and `API_BASE` update the saved
-API base URL as usual. Existing API-base precedence is unchanged.
+An API token and API base URL can be supplied as optional positional arguments
+in either order. URLs must start with `http://` or `https://`. The existing
+`--api-key`, `--api-base`, `API_KEY`, and `API_BASE` forms also work; named flags
+take precedence over positional arguments. Installer values are saved and used
+during that same installation. `GIT_AI_API_KEY` takes precedence for discovery
+over the saved key, including a key just supplied by the installer.
 
 ```sh
 git-ai install-hooks --dry-run --verbose
-git-ai install-hooks
+git-ai install-hooks https://api.example.com my-api-token
 ```
 
 Dry runs fetch and preview the configuration without saving agent or Git AI
